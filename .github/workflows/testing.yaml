@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -19,14 +19,19 @@ concurrency:
 
 permissions: {}
 
+env:
+  # The monorepo fixture: three images, chain-child FROM base-alpine.
+  # yamllint disable-line rule:line-length
+  MONOREPO_IMAGES: '[{"name":"base-alpine","context":"base-alpine"},{"name":"chain-child","context":"chain-child"},{"name":"util-echo","context":"util-echo"}]'
+
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Offline tests, including the differential against the lanes ###
+  unit:
+    name: "Unit and equivalence tests"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
@@ -36,7 +41,6 @@ jobs:
         with:
           config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Harden the runner with the just-loaded allow-list.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -46,45 +50,400 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Run tests"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Run tests
+          # A scripted docker stands in for the daemon, and the vendored
+          # lane bodies run under bash with jq, as on the runner.
+          set -euo pipefail
+          python3 -m unittest discover -s tests -t . -v
 
-      - name: "Running local action: ${{ github.repository }}"
+  ### Load mode: a real same-repository FROM chain ###
+  load:
+    name: "Load mode (monorepo fixture)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      # The builds pull the fixture's digest-pinned alpine and busybox
+      # bases from Docker Hub, which the allow-list carries.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: fixture
+          persist-credentials: false
+
+      # As an earlier step in a caller's job might. The docker driver
+      # setup selects nothing, so without the action pinning its own
+      # builder this one would take the builds, and chain-child could
+      # not see base-alpine:verify. Created only, never booted.
+      - name: "Select a docker-container builder first"
+        shell: bash
+        run: |
+          # Select a docker-container builder first
+          docker buildx create --name stray --driver docker-container --use
+
+      - name: "Build images"
+        id: build
         uses: $/
         with:
-          input: "test input 💬"
+          path_prefix: fixture
+          images: ${{ env.MONOREPO_IMAGES }}
+          build_flags: '--label org.opencontainers.image.source=ci'
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Validate outputs and the chain"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          IMAGES: ${{ steps.build.outputs.images }}
+          IMAGE_COUNT: ${{ steps.build.outputs.image_count }}
+          IMAGES_LIST: ${{ steps.build.outputs.images_list }}
+          RESULTS: ${{ steps.build.outputs.results }}
+          FAILED_COUNT: ${{ steps.build.outputs.failed_count }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Validate outputs and the chain
+          set -euo pipefail
+          tags='["base-alpine","chain-child","util-echo"] | map(. + ":verify")'
+          jq -e --argjson got "${IMAGES}" "${tags} == \$got" <<< null
+          [ "${IMAGE_COUNT}" = 3 ] && [ "${FAILED_COUNT}" = 0 ]
+          [ "${IMAGES_LIST}" = "$(jq -r "${tags} | join(\" \")" <<< null)" ]
+          jq -e 'map(.status) == ["built","built","built"]' <<< "${RESULTS}"
+          # chain-child builds FROM base-alpine:verify, so its output
+          # carries both markers only if the base built first, locally.
+          output=$(docker run --rm chain-child:verify)
+          grep -q "base-alpine fixture marker" <<< "${output}"
+          grep -q "chain-child fixture marker" <<< "${output}"
+          # build_flags reached the build.
+          label=$(docker image inspect util-echo:verify --format \
+            '{{ index .Config.Labels "org.opencontainers.image.source" }}')
+          [ "${label}" = ci ]
+          echo "Load mode validated ✅"
 
+  ### The build_command escape hatch: the fixture's own Makefile ###
+  build-command:
+    name: "build_command (make)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: $/
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
         with:
-          invalid_input: "Some garbage"
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: fixture
+          persist-credentials: false
+
+      - name: "Infer the images make builds"
+        id: inferred
+        uses: $/
+        with:
+          path_prefix: fixture
+          build_command: 'make images TAG=ci'
+
+      - name: "Declare the images make builds"
+        id: declared
+        uses: $/
+        with:
+          path_prefix: fixture
+          build_command: 'make images TAG=ci2'
+          build_command_images: 'base-alpine:ci2 chain-child:ci2 util-echo:ci2'
+
+      - name: "Validate outputs"
+        shell: bash
+        env:
+          INFERRED: ${{ steps.inferred.outputs.images }}
+          DECLARED: ${{ steps.declared.outputs.images }}
+        run: |
+          # Validate outputs
+          set -euo pipefail
+          # The daemon lists new tags sorted; pulled bases carry a
+          # registry digest on the runner's classic store and are
+          # skipped.
+          names='["base-alpine","chain-child","util-echo"]'
+          jq -e --argjson got "${INFERRED}" \
+            "(${names} | map(. + \":ci\")) == \$got" <<< null
+          jq -e --argjson got "${DECLARED}" \
+            "(${names} | map(. + \":ci2\")) == \$got" <<< null
+          echo "build_command validated ✅"
+
+  ### Push mode against a local registry ###
+  push:
+    name: "Push mode (local registry)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    services:
+      registry:
+        # yamllint disable-line rule:line-length
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      # Multi-platform builds also pull the buildkit and binfmt images
+      # from Docker Hub.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: fixture
+          persist-credentials: false
+
+      - name: "Push, single platform"
+        id: single
+        uses: $/
+        with:
+          mode: push
+          path_prefix: fixture
+          images: ${{ env.MONOREPO_IMAGES }}
+          repositories: localhost:5000/test
+          tags: '1.0.0, 1.0-latest'
+
+      # The docker-container driver runs buildkit in a container, which
+      # reaches the host's localhost:5000 only on the host network; so
+      # this job sets the builder up itself.
+      - name: "Set up QEMU"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - name: "Set up buildx for the local registry"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: "Push, multi-platform"
+        id: multi
+        uses: $/
+        with:
+          mode: push
+          setup_buildx: 'false'
+          path_prefix: fixture
+          images: '[{"name":"util-echo","context":"util-echo"}]'
+          repositories: localhost:5000/multi
+          tags: '2.0.0'
+          platforms: 'linux/amd64,linux/arm64'
+
+      # A same-repository chain, multi-platform: chain-child builds FROM
+      # base-alpine:verify, which the docker-container builder can only
+      # resolve through the build context naming the pushed base.
+      - name: "Push a chain, multi-platform"
+        id: chain
+        uses: $/
+        with:
+          mode: push
+          setup_buildx: 'false'
+          path_prefix: fixture
+          # yamllint disable-line rule:line-length
+          images: '[{"name":"base-alpine","context":"base-alpine"},{"name":"chain-child","context":"chain-child"}]'
+          repositories: localhost:5000/chain
+          tags: '3.0.0'
+          platforms: 'linux/amd64,linux/arm64'
+
+      - name: "Validate digests against the registry"
+        shell: bash
+        env:
+          SINGLE: ${{ steps.single.outputs.pushed }}
+          SINGLE_COUNT: ${{ steps.single.outputs.pushed_count }}
+          MULTI: ${{ steps.multi.outputs.pushed }}
+        run: |
+          # Validate digests against the registry
+          set -euo pipefail
+          [ "${SINGLE_COUNT}" = 3 ]
+          manifest_digest() {
+            # The registry's own record of a tag's manifest digest.
+            local accept=()
+            for type in oci.image.index.v1 oci.image.manifest.v1 \
+              docker.distribution.manifest.list.v2 \
+              docker.distribution.manifest.v2; do
+              accept+=(-H "Accept: application/vnd.${type}+json")
+            done
+            curl -fsS -o /dev/null -D - "${accept[@]}" \
+              "http://localhost:5000/v2/$1/manifests/$2" \
+              | tr -d '\r' \
+              | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}'
+          }
+          check() {
+            local pushed="$1" tag="$2"
+            while IFS=$'\t' read -r image digest; do
+              repo="${image#localhost:5000/}"
+              actual=$(manifest_digest "${repo}" "${tag}")
+              if [ "${actual}" != "${digest}" ]; then
+                echo "::error::${image}:${tag} is ${actual}" \
+                  "in the registry; the action reported ${digest}"
+                exit 1
+              fi
+              echo "${image}:${tag} = ${digest} ✅"
+            done < <(jq -r '.[] | [.image, .digest] | @tsv' <<< "${pushed}")
+          }
+          check "${SINGLE}" 1.0.0
+          check "${SINGLE}" 1.0-latest
+          check "${MULTI}" 2.0.0
+          # A manifest list, holding both platforms.
+          platforms=$(docker buildx imagetools inspect \
+            localhost:5000/multi/util-echo:2.0.0 --format '{{json .Manifest}}' \
+            | jq -r '[.manifests[].platform | .os + "/" + .architecture]
+              | sort | join(",")')
+          [ "${platforms}" = 'linux/amd64,linux/arm64' ] ||
+            { echo "::error::manifest list has ${platforms}"; exit 1; }
+          # The scan platform's image came back locally under the tag.
+          docker image inspect util-echo:verify > /dev/null
+          # The chain: each platform's child carries its own base marker.
+          for platform in linux/amd64 linux/arm64; do
+            output=$(docker run --rm --platform "${platform}" \
+              localhost:5000/chain/chain-child:3.0.0)
+            grep -q "base-alpine fixture marker" <<< "${output}"
+            grep -q "chain-child fixture marker" <<< "${output}"
+            echo "chain-child ${platform} layers on its base ✅"
+          done
+          echo "Push mode validated ✅"
+
+  ### Failure modes ###
+  failures:
+    name: "Failure modes"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a  # v0.12.1
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create a project whose build fails"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create a project whose build fails
+          mkdir -p broken/bad broken/good
+          printf 'FROM scratch\nRUN false\n' > broken/bad/Dockerfile
+          printf 'FROM scratch\nCOPY Dockerfile /\n' > broken/good/Dockerfile
+
+      - name: "Failing build [expected failure]"
+        id: strict
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: broken
+          images: '[{"name":"bad","context":"bad"}]'
+
+      - name: "Failing build, permitted"
+        id: permitted
+        uses: $/
+        with:
+          path_prefix: broken
+          # yamllint disable-line rule:line-length
+          images: '[{"name":"bad","context":"bad"},{"name":"good","context":"good"}]'
+          build_permit_fail: 'true'
+
+      - name: "Owned flag [expected failure]"
+        id: owned
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: broken
+          images: '[{"name":"good","context":"good"}]'
+          build_flags: '--push'
+
+      - name: "Validate outcomes"
+        shell: bash
+        env:
+          STRICT: ${{ steps.strict.outcome }}
+          OWNED: ${{ steps.owned.outcome }}
+          PERMITTED_FAILED: ${{ steps.permitted.outputs.failed }}
+          PERMITTED_IMAGES: ${{ steps.permitted.outputs.images }}
+        run: |
+          # Validate outcomes
+          set -euo pipefail
+          [ "${STRICT}" = failure ] ||
+            { echo "::error::a failing build did not fail"; exit 1; }
+          [ "${OWNED}" = failure ] ||
+            { echo "::error::an owned flag was accepted"; exit 1; }
+          [ "${PERMITTED_FAILED}" = '["bad:verify"]' ]
+          [ "${PERMITTED_IMAGES}" = '["good:verify"]' ]
+          echo "Failure modes validated ✅"
