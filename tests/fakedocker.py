@@ -18,12 +18,16 @@ already in the store, the way a same-repository chain fails when its
 base was not built first. ``ARG`` defaults and ``--build-arg`` values
 substitute into ``FROM`` first.
 
+A push-by-digest ``--output`` stores a content-addressed manifest per
+name and no tag; ``buildx imagetools inspect --raw`` serves it back.
+
 State lives in the JSON file ``$FAKEDOCKER_STATE``; every invocation
 appends its argv to ``$FAKEDOCKER_LOG``, one JSON array per line.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -151,11 +155,18 @@ def _buildx(state: State, args: list[str]) -> int:
     dockerfile = ""
     metadata = ""
     push = False
+    output: dict[str, str] = {}
     positional: list[str] = []
     it = iter(args)
     for arg in it:
         if arg in ("-f", "--file"):
             dockerfile = next(it)
+        elif arg in ("-o", "--output"):
+            parsed = _output(next(it))
+            if parsed is None:
+                return _fail("ERROR: invalid value in --output")
+            output = parsed
+            push = output.get("push") == "true"
         elif arg in ("-t", "--tag"):
             tags.append(next(it))
         elif arg == "--build-arg":
@@ -185,7 +196,7 @@ def _buildx(state: State, args: list[str]) -> int:
     for ref in _resolve_from(text, build_args):
         if not ref.endswith(":verify"):
             continue
-        # A --push build runs in the docker-container builder, which
+        # A pushing build runs in the docker-container builder, which
         # cannot see the daemon's tags: a same-repository base resolves
         # only through a named build context, as real BuildKit does.
         if push:
@@ -194,6 +205,8 @@ def _buildx(state: State, args: list[str]) -> int:
                 return _fail(f"ERROR: pull access denied for {repository(ref)}")
         elif _find(state, ref) is None:
             return _fail(f"ERROR: pull access denied for {repository(ref)}")
+    if output.get("push-by-digest") == "true":
+        return _push_by_digest(state, output, context, metadata)
     if push:
         digest = "sha256:" + _hash("manifest", *tags)
         for tag in tags:
@@ -205,6 +218,52 @@ def _buildx(state: State, args: list[str]) -> int:
     if state["store"] == "containerd":
         digests = [f"{repository(t)}@sha256:{_hash('local', t)}" for t in tags]
     _new_image(state, tags, digests, "build")
+    return 0
+
+
+def _output(value: str) -> dict[str, str] | None:
+    """An --output value, parsed as buildx parses it: one CSV record.
+
+    A field without '=' is refused, as buildx refuses the unquoted
+    second repository of name=a,b.
+    """
+    fields = next(csv.reader([value]))
+    if any("=" not in item for item in fields):
+        return None
+    return dict(item.split("=", 1) for item in fields)
+
+
+def _push_by_digest(
+    state: State, output: dict[str, str], context: str, metadata: str
+) -> int:
+    """Push one manifest, untagged, to every name in the output.
+
+    The manifest is content-addressed, so its digest is the hash of the
+    bytes ``imagetools inspect --raw`` returns. A name listed in
+    ``drop_manifests`` models a registry that does not serve it.
+    """
+    if output.get("type") != "image" or output.get("push") != "true":
+        return _fail("fakedocker: push-by-digest needs type=image,push=true", 2)
+    state["counter"] += 1
+    names = output.get("name", "").split(",")
+    manifest = json.dumps({"context": context, "build": state["counter"]})
+    digest = "sha256:" + hashlib.sha256(manifest.encode()).hexdigest()
+    manifests = state.setdefault("manifests", {})
+    for name in names:
+        if name not in state.get("drop_manifests", []):
+            manifests[f"{name}@{digest}"] = manifest
+    if metadata:
+        Path(metadata).write_text(json.dumps({"containerimage.digest": digest}))
+    return 0
+
+
+def _imagetools(state: State, args: list[str]) -> int:
+    if args[:2] != ["inspect", "--raw"] or len(args) != 3:
+        return _fail(f"fakedocker: unsupported imagetools {args!r}", 2)
+    manifest = state.get("manifests", {}).get(args[2])
+    if manifest is None:
+        return _fail(f"ERROR: {args[2]}: not found")
+    sys.stdout.write(manifest)
     return 0
 
 
@@ -282,6 +341,8 @@ def main(argv: list[str]) -> int:
 def _dispatch(state: State, argv: list[str]) -> int:
     if argv[:2] == ["buildx", "build"]:
         return _buildx(state, argv[2:])
+    if argv[:2] == ["buildx", "imagetools"]:
+        return _imagetools(state, argv[2:])
     if argv[:1] == ["build"]:
         return _buildx(state, argv[1:])
     if argv[:2] == ["image", "inspect"]:

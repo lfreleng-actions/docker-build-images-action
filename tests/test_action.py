@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 from scripts.settings import IMAGES_ERROR
-from tests.support import ROOT, SandboxTestCase, run_action
+from tests.support import ROOT, Run, SandboxTestCase, run_action
 
 BASE = "FROM alpine:3\n"
 CHILD = "ARG BASE=base:verify\nFROM ${BASE}\n"
@@ -453,6 +453,133 @@ class PushTest(SandboxTestCase):
         self.assertIn("INPUT_IMAGE_NAMESPACE", plan)
 
 
+BY_DIGEST = "push-by-digest=true,name-canonical=true,push=true"
+
+
+class PushByDigestTest(SandboxTestCase):
+    """push_by_digest: untagged pushes, one digest record per registry."""
+
+    def push(self, *names: str, **inputs: str) -> Run:
+        self.sandbox.write(CHAIN)
+        return run_action(
+            self.sandbox, env=AMD64, mode="push", push_by_digest="true",
+            images=images(*names), **inputs,
+        )  # fmt: skip
+
+    def builds(self, run: Run) -> list[list[str]]:
+        return [c for c in run.mutations if c[:2] == ["buildx", "build"]]
+
+    def assert_untagged(self, run: Run, names: tuple[str, ...]) -> None:
+        """Every repository serves its pushed digest, and nothing is tagged."""
+        pushed = json.loads(run.outputs["pushed"])
+        self.assertEqual(run.outputs["pushed_count"], str(len(pushed)))
+        self.assertEqual(run.state["pushed"], {}, "no tag was pushed")
+        self.assertFalse(any(c[0] == "push" for c in run.mutations))
+        served = run.state["manifests"]
+        for entry in pushed:
+            self.assertIn(entry["name"], names)
+            self.assertNotIn("@", entry["image"])
+            ref = f"{entry['image']}@{entry['digest']}"
+            self.assertIn(ref, served)
+            # Recorded only once that registry served it by digest.
+            self.assertIn(["buildx", "imagetools", "inspect", "--raw", ref], run.calls)
+
+    def test_single_platform_chain_pushes_untagged(self) -> None:
+        run = self.push("base", "child", repositories="localhost:5000/a\nghcr.io/o")
+        self.assertEqual(run.status, 0, run.stdout)
+        base, child = self.builds(run)
+        self.assertEqual(
+            base[:7],
+            [
+                "buildx", "build", "--platform", "linux/amd64", "--output",
+                f'type=image,"name=localhost:5000/a/base,ghcr.io/o/base",{BY_DIGEST}',
+                "--provenance=false",
+            ],
+        )  # fmt: skip
+        for build in (base, child):
+            self.assertFalse({"-t", "--push", "--load"} & set(build), build)
+        pushed = json.loads(run.outputs["pushed"])
+        self.assertEqual(
+            [(p["name"], p["image"]) for p in pushed],
+            [
+                ("base", "localhost:5000/a/base"),
+                ("base", "ghcr.io/o/base"),
+                ("child", "localhost:5000/a/child"),
+                ("child", "ghcr.io/o/child"),
+            ],
+        )
+        self.assert_untagged(run, ("base", "child"))
+        # The chain resolves through the pushed base, and later jobs
+        # get the pushed bits back under the local tag.
+        source = f"localhost:5000/a/base@{pushed[0]['digest']}"
+        self.assertIn(f"--build-context=base:verify=docker-image://{source}", child)
+        self.assertIn(["pull", "--platform", "linux/amd64", source], run.mutations)
+        self.assertIn(["tag", source, "base:verify"], run.mutations)
+        self.assertEqual(run.outputs["images"], '["base:verify","child:verify"]')
+
+    def test_multi_platform_pushes_an_untagged_index(self) -> None:
+        run = self.push(
+            "base", repositories="ghcr.io/o", platforms="linux/amd64,linux/arm64"
+        )
+        self.assertEqual(run.status, 0, run.stdout)
+        (build,) = self.builds(run)
+        self.assertEqual(
+            build[2:6],
+            [
+                "--platform", "linux/amd64,linux/arm64", "--output",
+                f'type=image,"name=ghcr.io/o/base",{BY_DIGEST}',
+            ],
+        )  # fmt: skip
+        self.assert_untagged(run, ("base",))
+
+    def test_a_registry_missing_the_digest_fails_the_image(self) -> None:
+        self.sandbox.seed(drop_manifests=["ghcr.io/o/base"])
+        run = self.push("base", "util", repositories="localhost:5000/a,ghcr.io/o")
+        self.assertEqual(run.status, 1)
+        pushed = json.loads(run.outputs["pushed"])
+        # The registry that served it is reported; the one that did not
+        # is named in the error.
+        self.assertEqual([p["image"] for p in pushed], ["localhost:5000/a/base"])
+        ref = f"ghcr.io/o/base@{pushed[0]['digest']}"
+        self.assertIn(
+            f"::error::docker buildx imagetools inspect {ref} failed (exit 1): "
+            f"ERROR: {ref}: not found",
+            run.annotations,
+        )
+        statuses = [
+            (r["name"], r["status"]) for r in json.loads(run.outputs["results"])
+        ]
+        self.assertEqual(statuses, [("base", "failed"), ("util", "skipped")])
+
+    def test_without_repositories_is_a_dry_run(self) -> None:
+        run = self.push("base", "child")
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertTrue(all("--load" in b for b in self.builds(run)))
+        self.assertEqual(run.outputs["pushed"], "[]")
+        self.assertNotIn("manifests", run.state)
+
+    def test_plan_pushes_from_a_docker_container_builder(self) -> None:
+        # The docker driver refuses push-by-digest (buildx build/opt.go),
+        # so a single platform needs docker-container too, and no QEMU.
+        cases = [
+            ({"repositories": "ghcr.io/o"}, "docker-container", "false"),
+            ({"repositories": "ghcr.io/o", "platforms": "linux/amd64,linux/arm64"},
+             "docker-container", "true"),
+            ({}, "docker", "false"),
+        ]  # fmt: skip
+        for inputs, driver, qemu in cases:
+            with self.subTest(inputs=inputs):
+                env = {"mode": "push", "push_by_digest": "true", **inputs}
+                run = self.sandbox.invoke(
+                    [sys.executable, "-I", str(ROOT / "entrypoint.py"), "plan"],
+                    {**AMD64, **{f"INPUT_{k.upper()}": v for k, v in env.items()}},
+                )
+                self.assertEqual(run.status, 0, run.stdout)
+                self.assertEqual(
+                    (run.outputs["driver"], run.outputs["qemu"]), (driver, qemu)
+                )
+
+
 class BuildFlagsTest(SandboxTestCase):
     """build_flags: raw buildx flags, shared and per image."""
 
@@ -590,6 +717,32 @@ class ValidationTest(SandboxTestCase):
                     (run.status, run.annotations), (1, [f"::error::{message}"])
                 )
                 self.assertEqual(run.mutations, [], "nothing built")
+
+    def test_push_by_digest_combinations(self) -> None:
+        self.sandbox.write(CHAIN)
+        cases = {
+            "push_by_digest applies to mode: push only": {"push_by_digest": "true"},
+            "tags cannot be set with push_by_digest: true, which pushes untagged": {
+                "mode": "push", "push_by_digest": "true", "repositories": "ghcr.io/o",
+                "tags": "1"},
+            "push_by_digest must be 'true' or 'false', got 'maybe'": {
+                "mode": "push", "push_by_digest": "maybe"},
+        }  # fmt: skip
+        for message, inputs in cases.items():
+            for command in ([], ["plan"]):
+                with self.subTest(inputs=inputs, command=command):
+                    run = self.sandbox.invoke(
+                        [sys.executable, "-I", str(ROOT / "entrypoint.py"), *command],
+                        {
+                            **AMD64,
+                            "INPUT_IMAGES": images("base"),
+                            **{f"INPUT_{k.upper()}": v for k, v in inputs.items()},
+                        },
+                    )
+                    self.assertEqual(
+                        (run.status, run.annotations), (1, [f"::error::{message}"])
+                    )
+                    self.assertEqual(run.calls, [], "nothing built")
 
     def test_repository_prefixes(self) -> None:
         self.sandbox.write(CHAIN)
