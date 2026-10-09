@@ -10,6 +10,7 @@ tests substitute a scripted stand-in.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -96,6 +97,28 @@ def repo_digests(ref: str, cwd: str) -> list[str]:
     if proc.returncode != 0:
         raise _inspect_failed(ref, proc)
     return [line for line in proc.stdout.split("\n") if line]
+
+
+def served_digest(ref: str, cwd: str) -> str:
+    """The digest of the manifest a registry serves for ``ref``.
+
+    The hash of the raw bytes, which is what a content-addressed
+    registry stores the manifest under. Anything short of a served
+    manifest is an error, naming docker's own reason.
+    """
+    proc = subprocess.run(
+        ["docker", "buildx", "imagetools", "inspect", "--raw", ref],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        lines = proc.stderr.decode(errors="replace").strip().splitlines()
+        raise ActionError(
+            f"docker buildx imagetools inspect {ref} failed (exit {proc.returncode}): "
+            f"{(lines[-1:] or ['no error output'])[0]}"
+        )
+    return "sha256:" + hashlib.sha256(proc.stdout).hexdigest()
 
 
 def digest_count(ref: str, cwd: str) -> str:

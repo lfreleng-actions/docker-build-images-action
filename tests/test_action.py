@@ -484,7 +484,6 @@ class PushByDigestTest(SandboxTestCase):
             # Recorded only once that registry served it by digest.
             self.assertIn(["buildx", "imagetools", "inspect", "--raw", ref], run.calls)
 
-    @unittest.expectedFailure
     def test_single_platform_chain_pushes_untagged(self) -> None:
         run = self.push("base", "child", repositories="localhost:5000/a\nghcr.io/o")
         self.assertEqual(run.status, 0, run.stdout)
@@ -518,7 +517,6 @@ class PushByDigestTest(SandboxTestCase):
         self.assertIn(["tag", source, "base:verify"], run.mutations)
         self.assertEqual(run.outputs["images"], '["base:verify","child:verify"]')
 
-    @unittest.expectedFailure
     def test_multi_platform_pushes_an_untagged_index(self) -> None:
         run = self.push(
             "base", repositories="ghcr.io/o", platforms="linux/amd64,linux/arm64"
@@ -534,7 +532,6 @@ class PushByDigestTest(SandboxTestCase):
         )  # fmt: skip
         self.assert_untagged(run, ("base",))
 
-    @unittest.expectedFailure
     def test_a_registry_missing_the_digest_fails_the_image(self) -> None:
         self.sandbox.seed(drop_manifests=["ghcr.io/o/base"])
         run = self.push("base", "util", repositories="localhost:5000/a,ghcr.io/o")
@@ -561,7 +558,6 @@ class PushByDigestTest(SandboxTestCase):
         self.assertEqual(run.outputs["pushed"], "[]")
         self.assertNotIn("manifests", run.state)
 
-    @unittest.expectedFailure
     def test_plan_pushes_from_a_docker_container_builder(self) -> None:
         # The docker driver refuses push-by-digest (buildx build/opt.go),
         # so a single platform needs docker-container too, and no QEMU.
@@ -722,7 +718,6 @@ class ValidationTest(SandboxTestCase):
                 )
                 self.assertEqual(run.mutations, [], "nothing built")
 
-    @unittest.expectedFailure
     def test_push_by_digest_combinations(self) -> None:
         self.sandbox.write(CHAIN)
         cases = {

@@ -27,7 +27,9 @@ Two modes cover the [docker-workflows] lanes:
   and merge lanes use it.
 - **`mode: push`** builds and pushes each image to every repository and
   tag, recording the digest of each push for signing. The release lane
-  uses it.
+  uses it. With `push_by_digest: true` it pushes each image untagged,
+  by digest alone, so a later job can tag it once the release gates
+  pass.
 
 Every default reproduces the build loops those lanes carried inline
 ([docker-workflows#34]), so each lane can swap its build step for this
@@ -71,6 +73,23 @@ steps:
     tags: '1.2.3'
     platforms: 'linux/amd64,linux/arm64'
 # steps.build.outputs.pushed: [{"name":..., "image":..., "digest":...}]
+```
+
+### Release: push untagged, tag after the gates
+
+```yaml
+- id: build
+  uses: lfreleng-actions/docker-build-images-action@<sha>  # vX.Y.Z
+  with:
+    mode: push
+    push_by_digest: 'true'
+    images: ${{ steps.images.outputs.images_json }}
+    repositories: |
+      ghcr.io/my-org
+      docker.io/my-org
+    platforms: 'linux/amd64,linux/arm64'
+# Gate, then tag each {image, digest} in pushed, for example with
+# crane tag <image>@<digest> 1.2.3
 ```
 
 ### Project tooling builds the images
@@ -129,7 +148,8 @@ that would then read as built.
 | `build_flags`          | False    | `''`      | Extra buildx arguments for every image, split as a shell splits them                               |
 | `mode`                 | False    | `load`    | `load` into the daemon, or `push` to registries                                                    |
 | `repositories`         | False    | `''`      | `mode: push`: repository prefixes; each image pushes as `<prefix>/<name>`. Empty is a dry run      |
-| `tags`                 | False    | `''`      | `mode: push`: tags to push; required with `repositories`                                           |
+| `tags`                 | False    | `''`      | `mode: push`: tags to push; required with `repositories`, refused with `push_by_digest`            |
+| `push_by_digest`       | False    | `false`   | `mode: push`: push untagged, by digest; see [Pushing by digest](#pushing-by-digest)                |
 | `platforms`            | False    | `''`      | `mode: push`: comma-separated platforms; empty is the runner's                                     |
 | `build_permit_fail`    | False    | `false`   | `mode: load`: report failed builds and pass the step                                               |
 | `skip_dependents`      | False    | `false`   | `mode: load`: skip an image whose same-repository base did not build                               |
@@ -144,16 +164,16 @@ that would then read as built.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name           | Description                                                                          |
-| -------------- | ------------------------------------------------------------------------------------ |
-| `images`       | JSON list of the local tags built, in build order                                    |
-| `image_count`  | Number of images built                                                               |
-| `images_list`  | Space-separated local tags, the form docker-save-images-action takes                 |
-| `failed`       | JSON list of failed builds: tags, or `build_command` when the escape hatch fails     |
-| `failed_count` | Number of failed builds                                                              |
-| `results`      | JSON list of `{name, tag, status}`, status `built`, `failed` or `skipped`            |
-| `pushed`       | `mode: push`: JSON list of `{name, image, digest}`, one per pushed repository        |
-| `pushed_count` | Number of pushed image repositories                                                  |
+| Name           | Description                                                                                           |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| `images`       | JSON list of the local tags built, in build order                                                     |
+| `image_count`  | Number of images built                                                                                |
+| `images_list`  | Space-separated local tags, the form docker-save-images-action takes                                  |
+| `failed`       | JSON list of failed builds: tags, or `build_command` when the escape hatch fails                      |
+| `failed_count` | Number of failed builds                                                                               |
+| `results`      | JSON list of `{name, tag, status}`, status `built`, `failed` or `skipped`                             |
+| `pushed`       | `mode: push`: JSON list of `{name, image, digest}`, one per pushed repository; `image` carries no tag |
+| `pushed_count` | Number of pushed image repositories                                                                   |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -199,10 +219,11 @@ and skips it with a notice otherwise, since local tags never publish.
 
 ### Pushing and digests
 
-A single-platform build loads locally, then pushes each reference. The
-digest comes from the daemon's record of that push, never re-read
-through the tag, so a concurrent writer moving the tag cannot make a
-signing job sign something other than what this run pushed.
+A tagged single-platform build loads locally, then pushes each
+reference. The digest comes from the daemon's record of that push,
+never re-read through the tag, so a concurrent writer moving the tag
+cannot make a signing job sign something other than what this run
+pushed.
 
 A multi-platform build pushes a manifest list straight to the
 registries, and takes its digest from buildx's build metadata. It then
@@ -225,14 +246,68 @@ With no repositories there is nowhere to
 hold a manifest list, so the scan platform alone builds, with a
 warning.
 
+### Pushing by digest
+
+`push_by_digest: true` pushes every image without a tag. A release
+that tags the image after its lint, SBOM, scan and test gates pass
+leaves no pullable version tag behind when a gate fails
+([docker-workflows#117]). `tags` must then be empty; the action refuses
+the two together, so a run has one meaning.
+
+Each build exports straight to the registries, with
+`--output type=image,"name=<repo1>,<repo2>",push-by-digest=true,name-canonical=true,push=true`.
+buildx reads `--output` as a CSV record, so the action quotes the list
+of names into one field. The digest comes from `containerimage.digest`
+in the build metadata: an image index for a multi-platform build, an
+image manifest for one platform. The action then reads the manifest
+back from each repository's own registry, by digest, and records it in
+`pushed` once that registry serves it. `image` is the bare repository,
+which keeps the shape of `pushed`. As in a tagged multi-platform push, the scan
+platform comes back by digest under `<name>:<local_tag>`, and later
+images in a same-repository chain build on the pushed base through a
+named build context.
+
+A single platform builds this way too. Three ways to push one platform
+by digest exist, and the action uses the second:
+
+<!-- markdownlint-disable MD013 -->
+
+| Approach                                               | Finding                                                                                                                                                  |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker` driver, on either image store                 | buildx refuses push-by-digest on the `docker` driver before it consults the store (`build/opt.go`, v0.37.2)                                              |
+| `docker-container` driver, `--build-context` chains    | Works; the chain resolves through the pushed base; 25s for a two-image chain from a cold cache                                                           |
+| `docker` driver `--load`, then `docker save` and crane | Works; 26s for the same chain; needs crane, which GitHub's runners lack, recompresses every layer, and tags `latest` unless pushed to an explicit digest |
+
+<!-- markdownlint-enable MD013 -->
+
+The `docker-container` route adds no tool, takes no longer, and shares
+the multi-platform path the action already tests.
+
+With no repositories, `push_by_digest` builds and loads as a dry run,
+as `mode: push` does without it.
+
+**Garbage collection.** A registry may delete an untagged manifest
+before anything tags it. Cleanup jobs that prune untagged versions,
+such as `actions/delete-package-versions` on GHCR set to delete
+untagged versions, or Nexus cleanup policies and its "Delete unused
+manifests and images" task, can remove a staged digest between this
+push and the tagging job. How Artifactory and Docker Hub treat
+untagged manifests remains unverified. A caller should check that
+every digest still exists, for example with
+`crane manifest <image>@<digest>`, before signing or tagging it, and
+fail when one has gone. A gate failure leaves untagged digests behind
+on purpose, for registry cleanup to remove later.
+
 ### Builder
 
 The composite action plans the builder before building. The `docker`
 driver builds against the daemon's own image store, which
 same-repository chains need: under `docker-container`, an image one
 build loads is invisible to the next build's `FROM`. A multi-platform
-push is the one case that needs `docker-container`, which also brings
-in QEMU. Every build, `build_command`'s included, then runs on that
+push needs `docker-container`, with QEMU. `push_by_digest` needs
+`docker-container` on any platform, since buildx refuses to push by
+digest from the `docker` driver. Every build, `build_command`'s
+included, then runs on that
 builder through `BUILDX_BUILDER`, because setting up the `docker`
 driver selects nothing and a `docker-container` builder the job
 selected earlier would otherwise take the builds. Set
@@ -313,5 +388,6 @@ workflow adds real builds, a real registry, and multi-platform pushes.
 [docker-build-matrix-action]: https://github.com/lfreleng-actions/docker-build-matrix-action
 [docker-workflows]: https://github.com/lfreleng-actions/docker-workflows
 [docker-workflows#34]: https://github.com/lfreleng-actions/docker-workflows/issues/34
+[docker-workflows#117]: https://github.com/lfreleng-actions/docker-workflows/issues/117
 [pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/docker-build-images-action/main
 [pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/docker-build-images-action/main.svg

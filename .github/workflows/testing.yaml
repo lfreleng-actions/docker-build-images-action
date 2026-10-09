@@ -369,6 +369,181 @@ jobs:
           done
           echo "Push mode validated ✅"
 
+  ### push_by_digest against two local registries ###
+  push-by-digest:
+    name: "Push by digest (local registries)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    # Two registries, so each pushed repository's digest is read back
+    # from a registry of its own.
+    services:
+      registry:
+        # yamllint disable-line rule:line-length
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+      mirror:
+        # yamllint disable-line rule:line-length
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5001:5000
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: fixture
+          persist-credentials: false
+
+      # push_by_digest builds in docker-container on every platform, and
+      # buildkit reaches the host's registries only on the host network.
+      - name: "Set up QEMU"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - name: "Set up buildx for the local registries"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      # chain-child builds FROM base-alpine:verify, which resolves only
+      # through the build context naming the base's pushed digest.
+      - name: "Push by digest, single platform"
+        id: single
+        uses: $/
+        with:
+          mode: push
+          push_by_digest: 'true'
+          setup_buildx: 'false'
+          path_prefix: fixture
+          images: ${{ env.MONOREPO_IMAGES }}
+          repositories: |
+            localhost:5000/single
+            localhost:5001/single
+
+      - name: "Push by digest, multi-platform"
+        id: multi
+        uses: $/
+        with:
+          mode: push
+          push_by_digest: 'true'
+          setup_buildx: 'false'
+          path_prefix: fixture
+          # yamllint disable-line rule:line-length
+          images: '[{"name":"base-alpine","context":"base-alpine"},{"name":"chain-child","context":"chain-child"}]'
+          repositories: |
+            localhost:5000/multi
+            localhost:5001/multi
+          platforms: 'linux/amd64,linux/arm64'
+
+      - name: "Validate untagged digests in each registry"
+        shell: bash
+        env:
+          SINGLE: ${{ steps.single.outputs.pushed }}
+          MULTI: ${{ steps.multi.outputs.pushed }}
+        run: |
+          # Validate untagged digests in each registry
+          set -euo pipefail
+          accept=()
+          for type in oci.image.index.v1 oci.image.manifest.v1 \
+            docker.distribution.manifest.list.v2 \
+            docker.distribution.manifest.v2; do
+            accept+=(-H "Accept: application/vnd.${type}+json")
+          done
+          check() {
+            local pushed="$1" count="$2"
+            [ "$(jq length <<< "${pushed}")" = "${count}" ] ||
+              { echo "::error::expected ${count} entries: ${pushed}"; exit 1; }
+            jq -e '[.[].image | split("/")[0]] | unique
+              == ["localhost:5000", "localhost:5001"]' <<< "${pushed}"
+            while IFS=$'\t' read -r image digest; do
+              registry="${image%%/*}"
+              repo="${image#*/}"
+              # The registry serves the manifest by the reported digest.
+              actual=$(curl -fsS -o /dev/null -D - "${accept[@]}" \
+                "http://${registry}/v2/${repo}/manifests/${digest}" \
+                | tr -d '\r' \
+                | awk -F': ' \
+                  'tolower($1) == "docker-content-digest" {print $2}')
+              if [ "${actual}" != "${digest}" ]; then
+                echo "::error::${image}@${digest} is ${actual:-missing}"
+                exit 1
+              fi
+              # And holds no tag: registry:2 answers 404 for a
+              # repository without one.
+              status=$(curl -sS -o tags.json -w '%{http_code}' \
+                "http://${registry}/v2/${repo}/tags/list")
+              if [ "${status}" = 200 ] &&
+                [ "$(jq '.tags // [] | length' tags.json)" != 0 ]; then
+                echo "::error::${image} carries tags: $(cat tags.json)"
+                exit 1
+              elif [ "${status}" != 200 ] && [ "${status}" != 404 ]; then
+                echo "::error::tags/list for ${image} answered ${status}"
+                exit 1
+              fi
+              echo "${image}@${digest} present, untagged ✅"
+            done < <(jq -r '.[] | [.image, .digest] | @tsv' <<< "${pushed}")
+          }
+          check "${SINGLE}" 6
+          check "${MULTI}" 4
+          digest_of() {
+            jq -r --arg image "$2" \
+              '.[] | select(.image == $image) | .digest' <<< "$1"
+          }
+          # Single platform: the chain, run from the registry the
+          # action did not pull back from.
+          child="localhost:5001/single/chain-child"
+          digest=$(digest_of "${SINGLE}" "${child}")
+          output=$(docker run --rm "${child}@${digest}")
+          grep -q "base-alpine fixture marker" <<< "${output}"
+          grep -q "chain-child fixture marker" <<< "${output}"
+          # Multi-platform: an index of both platforms, each child on
+          # its own base.
+          child="localhost:5001/multi/chain-child"
+          digest=$(digest_of "${MULTI}" "${child}")
+          index=$(docker buildx imagetools inspect --raw "${child}@${digest}")
+          platforms=$(jq -r '[.manifests[].platform | .os + "/" + .architecture]
+            | sort | join(",")' <<< "${index}")
+          [ "${platforms}" = 'linux/amd64,linux/arm64' ] ||
+            { echo "::error::index has ${platforms}"; exit 1; }
+          for platform in linux/amd64 linux/arm64; do
+            manifest=$(jq -r --arg p "${platform}" '.manifests[]
+              | select(.platform.os + "/" + .platform.architecture == $p)
+              | .digest' <<< "${index}")
+            output=$(docker run --rm --platform "${platform}" \
+              "${child}@${manifest}")
+            grep -q "base-alpine fixture marker" <<< "${output}"
+            grep -q "chain-child fixture marker" <<< "${output}"
+            echo "chain-child ${platform} layers on its base ✅"
+          done
+          # The scan copy came back under the local tag.
+          docker image inspect chain-child:verify > /dev/null
+          echo "push_by_digest validated ✅"
+
   ### Failure modes ###
   failures:
     name: "Failure modes"
