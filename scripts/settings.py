@@ -134,6 +134,7 @@ class Settings:
     skip_dependents: bool = False
     repositories: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    push_by_digest: bool = False
     platforms: tuple[str, ...] = ()
     summary: bool = True
     setup_buildx: bool = True
@@ -162,6 +163,9 @@ class Settings:
             ),
             repositories=tuple(split_list(env("INPUT_REPOSITORIES"))),
             tags=tuple(split_list(env("INPUT_TAGS"))),
+            push_by_digest=gha.env_bool(
+                "INPUT_PUSH_BY_DIGEST", "push_by_digest", False
+            ),
             platforms=tuple(
                 p.strip() for p in env("INPUT_PLATFORMS").split(",") if p.strip()
             ),
@@ -190,13 +194,20 @@ class Settings:
             ):
                 if flag:
                     raise ActionError(f"{name} is not available with mode: push")
-            if self.repositories and not self.tags:
+            # One meaning per run: an untagged push carries no tags, and
+            # a tag would be the very publication it exists to defer.
+            if self.push_by_digest and self.tags:
+                raise ActionError(
+                    "tags cannot be set with push_by_digest: true, which pushes untagged"
+                )
+            if self.repositories and not self.tags and not self.push_by_digest:
                 raise ActionError("mode: push with repositories needs at least one tag")
         else:
             for name, value in (
                 ("repositories", self.repositories),
                 ("tags", self.tags),
                 ("platforms", self.platforms),
+                ("push_by_digest", self.push_by_digest),
             ):
                 if value:
                     raise ActionError(f"{name} applies to mode: push only")

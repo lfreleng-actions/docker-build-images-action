@@ -19,6 +19,17 @@ The local working tag is ``<name>:<local_tag>``, as in load mode, so
 same-repository chains resolve alike; the namespaced alias is added
 when the namespace is a usable local prefix and skipped (with a
 notice) otherwise, since local tags never publish.
+
+push_by_digest pushes every image untagged, so a release can tag it
+only once its gates pass. One platform needs the docker-container
+builder too: buildx refuses push-by-digest on the docker driver
+whatever the image store (build/opt.go, v0.37.2). The other route, a
+``docker save`` archive of the loaded image pushed with crane, needs a
+tool GitHub's runners lack, recompresses every layer, and tags
+``latest`` unless pushed to an explicit digest; on a two-image chain
+it took no less time (26s cold, against 25s). So one platform builds
+as several do: a named build context carries a chain, and the scan
+copy is pulled back by digest.
 """
 
 from __future__ import annotations
@@ -138,8 +149,8 @@ class _Plan:
     scan: str
     alias: bool
     metadata: str
-    # Named build contexts for images already pushed as manifest lists.
-    # The docker-container builder cannot see the daemon's tags, so a
+    # Named build contexts for images already pushed from the
+    # docker-container builder, which cannot see the daemon's tags, so a
     # later FROM <name>:verify would otherwise pull from Docker Hub;
     # this points it at the pushed image by digest, per platform.
     contexts: list[str] = field(default_factory=list)
@@ -154,19 +165,29 @@ def _build_one(
     repos = [f"{prefix}/{name}" for prefix in settings.repositories]
     refs = [f"{repo}:{tag}" for repo in repos for tag in settings.tags]
     tag_args = [arg for ref in refs for arg in ("-t", ref)]
-    if plan.multi and repos:
+    if (plan.multi or settings.push_by_digest) and repos:
+        if settings.push_by_digest:
+            destination = ["--output", _by_digest(repos)]
+        else:
+            destination = ["--push"]
         _build(
             [
-                "buildx", "build", "--platform", ",".join(plan.platforms), "--push",
+                "buildx", "build", "--platform", ",".join(plan.platforms), *destination,
                 "--provenance=false", "--sbom=false", "--metadata-file", plan.metadata,
                 *plan.contexts, *tag_args, *common, image["context"],
             ],
             cwd, f"Build/push {name} ({','.join(plan.platforms)})", local_tag,
         )  # fmt: skip
         image_digest = _metadata_digest(plan.metadata)
-        # The registries hold the manifest list now, so record it before
-        # the fallible pull-back: a failure there must not hide it.
-        _record_pushes(settings, name, repos, lambda _: image_digest, outcome)
+        # The registries hold the image now, so record it before the
+        # fallible pull-back: a failure there must not hide it.
+        _record_pushes(
+            settings,
+            name,
+            repos,
+            lambda repo: _registry_digest(settings, repo, image_digest, cwd),
+            outcome,
+        )
         source = f"{repos[0]}@{image_digest}"
         if docker.run(
             ["pull", "--platform", plan.scan, source], cwd, f"Pull {name} ({plan.scan})"
@@ -221,11 +242,41 @@ def _record_pushes(
     for repo in repos:
         digest = digest_of(repo)
         if not _DIGEST.fullmatch(digest):
-            raise ActionError(
-                f"Failed to resolve digest for {repo}:{settings.tags[0]} (got: {digest})"
-            )
+            pushed = f"{repo}:{settings.tags[0]}" if settings.tags else repo
+            raise ActionError(f"Failed to resolve digest for {pushed} (got: {digest})")
         gha.log(f"{repo}@{digest}")
         outcome.pushed.append({"name": name, "image": repo, "digest": digest})
+
+
+def _by_digest(repos: list[str]) -> str:
+    """The --output that pushes one untagged manifest to every repository.
+
+    buildx reads --output as one CSV record, so the comma-separated
+    names are quoted into a single field; unquoted, it refuses the
+    second name as an invalid value. Repository names hold no quote or
+    comma, which settings validation guarantees.
+    """
+    names = ",".join(repos)
+    return (
+        f'type=image,"name={names}",push-by-digest=true,name-canonical=true,push=true'
+    )
+
+
+def _registry_digest(settings: Settings, repo: str, digest: str, cwd: str) -> str:
+    """The digest to record for ``repo`` after a push from BuildKit.
+
+    buildx pushes the same bytes to every name, so its one digest covers
+    them all by construction. With push_by_digest the digest is read
+    back from each repository's own registry, which makes ``pushed`` a
+    per-registry record rather than that assumption, and catches a
+    registry that did not keep an untagged manifest.
+    """
+    if not settings.push_by_digest or not _DIGEST.fullmatch(digest):
+        return digest
+    served = docker.served_digest(f"{repo}@{digest}", cwd)
+    if served != digest:
+        raise ActionError(f"{repo}@{digest} is served as {served} by its registry")
+    return served
 
 
 def _metadata_digest(path: str) -> str:

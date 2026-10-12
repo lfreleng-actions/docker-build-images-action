@@ -80,9 +80,19 @@ inputs:
   tags:
     description: >
       mode: push. Comma- or whitespace-separated tags to push each image
-      under, such as '1.2.3'. Required when repositories is set.
+      under, such as '1.2.3'. Required when repositories is set, unless
+      push_by_digest is true, which refuses them.
     required: false
     default: ""
+  push_by_digest:
+    description: >
+      mode: push. Push each image untagged, by digest alone, and report
+      it in pushed, so a later job can tag it once its gates pass. Runs
+      the docker-container builder on one platform as on several.
+      Registry cleanup can delete an untagged manifest before it is
+      tagged; see the README.
+    required: false
+    default: "false"
   platforms:
     description: >
       mode: push. Comma-separated build platforms; empty is the runner's.
@@ -129,8 +139,8 @@ inputs:
     description: >
       Set up buildx with the driver the build needs: 'docker', whose
       daemon same-repository FROM chains need, or 'docker-container'
-      for a multi-platform push. Set false to use a builder already
-      set up.
+      for a multi-platform push or push_by_digest. Set false to use a
+      builder already set up.
     required: false
     default: "true"
   summary:
@@ -167,7 +177,9 @@ outputs:
   pushed:
     description: >
       mode: push. JSON list of {name, image, digest}, one per pushed
-      repository, the subjects to sign and attest
+      repository, the subjects to sign and attest. image is the
+      repository without a tag; with push_by_digest, each digest is
+      read back from that repository's registry
     value: ${{ steps.build.outputs.pushed }}
   pushed_count:
     description: "Number of pushed image repositories"
@@ -188,6 +200,7 @@ runs:
         INPUT_BUILD_FLAGS: ${{ inputs.build_flags }}
         INPUT_REPOSITORIES: ${{ inputs.repositories }}
         INPUT_TAGS: ${{ inputs.tags }}
+        INPUT_PUSH_BY_DIGEST: ${{ inputs.push_by_digest }}
         INPUT_PLATFORMS: ${{ inputs.platforms }}
         INPUT_BUILD_PERMIT_FAIL: ${{ inputs.build_permit_fail }}
         INPUT_SKIP_DEPENDENTS: ${{ inputs.skip_dependents }}
@@ -234,6 +247,7 @@ runs:
         INPUT_BUILD_FLAGS: ${{ inputs.build_flags }}
         INPUT_REPOSITORIES: ${{ inputs.repositories }}
         INPUT_TAGS: ${{ inputs.tags }}
+        INPUT_PUSH_BY_DIGEST: ${{ inputs.push_by_digest }}
         INPUT_PLATFORMS: ${{ inputs.platforms }}
         INPUT_BUILD_PERMIT_FAIL: ${{ inputs.build_permit_fail }}
         INPUT_SKIP_DEPENDENTS: ${{ inputs.skip_dependents }}

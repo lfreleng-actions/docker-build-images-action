@@ -7,8 +7,10 @@
 The docker driver builds against the daemon's own image store, which
 same-repository chains need: under the docker-container driver an
 image --load'ed by one build is invisible to the next build's FROM.
-Only a multi-platform push needs docker-container, since the docker
-driver cannot produce a manifest list, and QEMU for foreign platforms.
+A multi-platform push needs docker-container, since the docker driver
+cannot produce a manifest list, and QEMU for foreign platforms.
+push_by_digest needs docker-container on any platform, since buildx
+refuses push-by-digest on the docker driver.
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ def _multi(settings: Settings) -> bool:
 def plan(settings: Settings) -> dict[str, str]:
     """The buildx driver, whether to set it up, and whether QEMU is needed."""
     multi = _multi(settings)
-    container = multi and bool(settings.repositories)
+    container = (multi or settings.push_by_digest) and bool(settings.repositories)
     return {
         "driver": "docker-container" if container else "docker",
         "qemu": str(multi).lower(),
