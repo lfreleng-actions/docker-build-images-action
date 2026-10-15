@@ -39,7 +39,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -75,7 +75,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       # The builds pull the fixture's digest-pinned alpine and busybox
       # bases from Docker Hub, which the allow-list carries.
@@ -158,7 +158,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -233,7 +233,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       # Multi-platform builds also pull the buildkit and binfmt images
       # from Docker Hub.
@@ -393,7 +393,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -555,7 +555,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
