@@ -21,6 +21,15 @@ substitute into ``FROM`` first.
 A push-by-digest ``--output`` stores a content-addressed manifest per
 name and no tag; ``buildx imagetools inspect --raw`` serves it back.
 
+``buildx inspect`` names the builder's driver (``driver`` in the
+state, docker by default), and ``info`` reports the store as the
+DriverStatus docker prints. A build with a gha cache records the
+token it would hand BuildKit: the flag's ``token=`` attribute, else
+``ACTIONS_RUNTIME_TOKEN``, as buildx fills it. Every value a Dockerfile
+could read through buildx is recorded as ``exposed``: a bare
+``--build-arg NAME`` or a ``--secret`` with ``env=NAME`` from the
+environment, and ``src=/proc/self/cmdline``, buildx's own arguments.
+
 State lives in the JSON file ``$FAKEDOCKER_STATE``; every invocation
 appends its argv to ``$FAKEDOCKER_LOG``, one JSON array per line.
 """
@@ -170,14 +179,36 @@ def _buildx(state: State, args: list[str]) -> int:
         elif arg in ("-t", "--tag"):
             tags.append(next(it))
         elif arg == "--build-arg":
-            key, _, value = next(it).partition("=")
+            key, eq, value = next(it).partition("=")
+            if not eq:
+                # buildx fills a bare --build-arg from its environment.
+                value = os.environ.get(key, "")
+                state.setdefault("exposed", []).append(value)
             build_args[key] = value
+        elif arg == "--secret" or arg.startswith("--secret="):
+            spec = next(it) if arg == "--secret" else arg.split("=", 1)[1]
+            for item in spec.split(","):
+                if item.startswith("env="):
+                    state.setdefault("exposed", []).append(os.environ.get(item[4:], ""))
+                elif item == "src=/proc/self/cmdline":
+                    # buildx reads a file secret in its own process.
+                    state.setdefault("exposed", []).append(" ".join(sys.argv))
         elif arg == "--build-context" or arg.startswith("--build-context="):
             spec = next(it) if arg == "--build-context" else arg.split("=", 1)[1]
             name, _, source = spec.partition("=")
             contexts[name] = source
         elif arg in ("--target", "--platform"):
             next(it)
+        elif arg in ("--cache-from", "--cache-to"):
+            value = next(it)
+            if value.startswith("type=gha"):
+                attrs: dict[str, str] = {}
+                for item in value.split(","):
+                    key, _, attr = item.partition("=")
+                    attrs[key] = attr
+                state.setdefault("cache_tokens", []).append(
+                    attrs.get("token") or os.environ.get("ACTIONS_RUNTIME_TOKEN", "")
+                )
         elif arg == "--metadata-file":
             metadata = next(it)
         elif arg == "--push":
@@ -328,6 +359,25 @@ def _pull(state: State, args: list[str]) -> int:
     return 0
 
 
+def _buildx_inspect(state: State) -> int:
+    if state.get("fail_buildx_inspect"):
+        return _fail("ERROR: no builder found")
+    builder = os.environ.get("BUILDX_BUILDER") or "default"
+    print(f"Name:          {builder}")
+    print(f"Driver:        {state.get('driver', 'docker')}")
+    return 0
+
+
+def _info(state: State, args: list[str]) -> int:
+    if args != ["--format", "{{json .DriverStatus}}"]:
+        return _fail(f"fakedocker: unsupported info {args!r}", 2)
+    status = [["Backing Filesystem", "extfs"]]
+    if state["store"] == "containerd":
+        status.append(["driver-type", "io.containerd.snapshotter.v1"])
+    print(json.dumps(status))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     with open(os.environ["FAKEDOCKER_LOG"], "a", encoding="utf-8") as log:
         log.write(json.dumps(argv) + "\n")
@@ -343,6 +393,10 @@ def _dispatch(state: State, argv: list[str]) -> int:
         return _buildx(state, argv[2:])
     if argv[:2] == ["buildx", "imagetools"]:
         return _imagetools(state, argv[2:])
+    if argv[:2] == ["buildx", "inspect"]:
+        return _buildx_inspect(state)
+    if argv[:1] == ["info"]:
+        return _info(state, argv[1:])
     if argv[:1] == ["build"]:
         return _buildx(state, argv[1:])
     if argv[:2] == ["image", "inspect"]:

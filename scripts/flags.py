@@ -86,3 +86,8 @@ def image_flags(image: dict[str, Any]) -> list[str]:
             f"images entry '{image.get('name')}' has build_flags that is not a list of strings"
         )
     return _refuse_owned(value, f"images entry '{image.get('name')}' build_flags")
+
+
+def exports_cache(flags: list[str] | tuple[str, ...]) -> bool:
+    """Whether ``flags`` hold a ``--cache-to``, in either form."""
+    return any(flag == "--cache-to" or flag.startswith("--cache-to=") for flag in flags)

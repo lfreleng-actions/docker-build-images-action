@@ -19,7 +19,7 @@ it, when the entries carry depends_on from the matrix output.
 
 from __future__ import annotations
 
-from scripts import docker, gha
+from scripts import cache, docker, gha
 from scripts.flags import image_flags
 from scripts.outcome import Outcome
 from scripts.settings import Image, Settings
@@ -53,8 +53,13 @@ def build_args(image: Image, shared: tuple[str, ...] = ()) -> list[str]:
     return flags + list(shared) + image_flags(image)
 
 
-def build_all(settings: Settings, cwd: str, outcome: Outcome) -> None:
-    """Build every entry into the daemon, recording each result."""
+def build_all(
+    settings: Settings, cwd: str, outcome: Outcome, cache_access: str = ""
+) -> None:
+    """Build every entry into the daemon, recording each result.
+
+    ``cache_access`` is scripts/cache.py's access(); empty, no cache.
+    """
     namespace = settings.image_namespace
     unbuilt: set[str] = set()
     for image in settings.images:
@@ -75,6 +80,7 @@ def build_all(settings: Settings, cwd: str, outcome: Outcome) -> None:
                 continue
         args = ["buildx", "build", "--load", "-f", dockerfile_of(image), "-t", tag]
         args += build_args(image, settings.build_flags)
+        args += cache.flags(settings, name, cache_access)
         status = docker.run([*args, image["context"]], cwd, group=f"Build {tag}")
         if status != 0:
             gha.annotate("error", f"Build failed for {tag} (exit {status})")
