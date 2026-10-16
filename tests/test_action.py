@@ -18,6 +18,7 @@ import sys
 import unittest
 from unittest import mock
 
+from scripts.cache import Credentials
 from scripts.settings import IMAGES_ERROR
 from tests.support import ROOT, Run, SandboxTestCase, run_action
 
@@ -681,6 +682,285 @@ class BuildFlagsTest(SandboxTestCase):
         self.assertTrue(
             run.annotations[0].startswith("::error::build_flags could not be parsed")
         )
+
+
+# What action.yaml hands the build step for cache: gha.
+CREDENTIALS = {
+    "BUILD_IMAGES_CACHE_TOKEN": "runtime-token",
+    "BUILD_IMAGES_CACHE_RESULTS_URL": "https://results-receiver.example/",
+    "BUILD_IMAGES_CACHE_SERVICE_V2": "True",
+}
+# Passed to buildx in the cache flags, never in its environment.
+ATTRS = (
+    "token=runtime-token,url=https://results-receiver.example/,"
+    "url_v2=https://results-receiver.example/,version=2"
+)
+READ = "type=gha,scope={}," + ATTRS
+WRITE = READ + ",mode=max,ignore-error=true"
+
+
+class CacheTest(SandboxTestCase):
+    """cache: gha, opt-in, on the builders that can use it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sandbox.write(CHAIN)
+        self.sandbox.seed(driver="docker-container")
+
+    def run_cached(self, env: dict[str, str] | None = None, /, **inputs: str) -> Run:
+        inputs.setdefault("images", images("base", "child"))
+        return run_action(
+            self.sandbox, env={**AMD64, **CREDENTIALS, **(env or {})},
+            **{"cache": "gha", **inputs},
+        )  # fmt: skip
+
+    def builds(self, run: Run) -> list[list[str]]:
+        return [c for c in run.mutations if c[:2] == ["buildx", "build"]]
+
+    def cache_args(self, run: Run) -> list[list[str]]:
+        return [
+            [a for i, a in enumerate(b) if a.startswith("--cache-") or
+             (i and b[i - 1].startswith("--cache-"))]
+            for b in self.builds(run)
+        ]  # fmt: skip
+
+    def test_off_by_default_with_no_extra_calls(self) -> None:
+        run = run_action(self.sandbox, env=CREDENTIALS, images=images("base", "child"))
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(self.cache_args(run), [[], []])
+        self.assertFalse(
+            [c for c in run.calls if c[:2] == ["buildx", "inspect"] or c[0] == "info"],
+            "no builder probe without the cache",
+        )
+
+    def test_reads_by_default_one_scope_per_image(self) -> None:
+        run = self.run_cached()
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(
+            self.cache_args(run),
+            [
+                ["--cache-from", READ.format("base")],
+                ["--cache-from", READ.format("child")],
+            ],
+        )
+        self.assertEqual(run.state["cache_tokens"], ["runtime-token"] * 2)
+        self.assertIn(
+            "Layer cache: this run reads the GitHub Actions cache", run.stdout
+        )
+
+    def test_writes_only_when_asked(self) -> None:
+        run = self.run_cached(cache_write="true", cache_scope="release")
+        self.assertEqual(run.status, 0, run.stdout)
+        base, child = self.cache_args(run)
+        self.assertEqual(
+            base,
+            ["--cache-from", READ.format("release:base"),
+             "--cache-to", WRITE.format("release:base")],
+        )  # fmt: skip
+        self.assertEqual(child[1], READ.format("release:child"))
+
+    def test_push_modes_carry_the_cache(self) -> None:
+        for inputs in (
+            {"repositories": "ghcr.io/o", "tags": "1"},
+            {"repositories": "ghcr.io/o", "tags": "1", "platforms": "linux/amd64,linux/arm64"},
+            {"repositories": "ghcr.io/o", "push_by_digest": "true"},
+        ):  # fmt: skip
+            with self.subTest(inputs=inputs):
+                run = self.run_cached(mode="push", cache_write="true", **inputs)
+                self.assertEqual(run.status, 0, run.stdout)
+                self.assertEqual(
+                    [args[1] for args in self.cache_args(run)],
+                    [READ.format("base"), READ.format("child")],
+                )
+                self.assertTrue(all(len(a) == 4 for a in self.cache_args(run)))
+
+    def test_docker_driver_depends_on_the_image_store(self) -> None:
+        self.sandbox.seed(driver="docker")
+        unchanged = run_action(self.sandbox, env=AMD64, images=images("base", "child"))
+        classic = self.run_cached(cache_write="true")
+        self.assertEqual(classic.status, 0, classic.stdout)
+        self.assertEqual(classic.mutations, unchanged.mutations, "built as without it")
+        self.assertIn(
+            "::notice::cache: gha is not used: the docker driver on Docker's classic "
+            "image store cannot export a cache; same-repository chains in mode: load "
+            "need that driver. The images build without the cache; see the README's "
+            "Layer cache section",
+            classic.annotations,
+        )
+        self.sandbox.seed(store="containerd", images={})
+        containerd = self.run_cached()
+        self.assertEqual(containerd.status, 0, containerd.stdout)
+        self.assertEqual(len(self.cache_args(containerd)[0]), 2)
+
+    def test_unknown_builder_builds_without_it(self) -> None:
+        self.sandbox.seed(fail_buildx_inspect=True)
+        run = self.run_cached()
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(self.cache_args(run), [[], []])
+        self.assertIn("could not name the builder's driver", run.annotations[0])
+
+    def test_missing_credentials_warn(self) -> None:
+        run = self.run_cached({"BUILD_IMAGES_CACHE_TOKEN": ""})
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(self.cache_args(run), [[], []])
+        self.assertEqual(
+            run.annotations[0],
+            "::warning::cache: gha has no usable Actions cache token and URL, so "
+            "the images build without the cache",
+        )
+
+    def test_credentials_attributes(self) -> None:
+        for fields, expected in (
+            ({"token": "t", "cache_url": "https://c/"}, "token=t,url=https://c/"),
+            ({"token": "t", "results_url": "https://r/", "service_v2": "true"},
+             "token=t,url=https://r/,url_v2=https://r/,version=2"),
+            ({"token": "t", "results_url": "https://r/"}, "token=t,url=https://r/"),
+            ({"token": "t"}, ""),
+            ({"token": "t,x", "cache_url": "https://c/"}, ""),
+        ):  # fmt: skip
+            with self.subTest(fields=fields):
+                self.assertEqual(Credentials(**fields).attributes(), expected)
+        self.assertNotIn("secret", repr(Credentials(token="secret")))
+
+    def test_no_build_can_read_the_credentials(self) -> None:
+        # buildx fills a bare --build-arg NAME and a --secret env=NAME
+        # from its environment, and an images entry can come from the
+        # checkout. The token reaches the cache flags alone.
+        names = ("ACTIONS_RUNTIME_TOKEN", "BUILD_IMAGES_CACHE_TOKEN")
+        entries = json.dumps(
+            [{"name": "base", "context": "base", "build_args": list(names),
+              "build_flags": [f"--secret=id=a,env={names[1]}"]},
+             {"name": "child", "context": "child",
+              "build_flags": ["--secret", f"id=b,env={names[1]}"]}]
+        )  # fmt: skip
+        run = self.run_cached(
+            {"GITHUB_EVENT_NAME": "pull_request"}, images=entries,
+            build_flags=f"--secret id=c,env={names[0]}",
+        )  # fmt: skip
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(run.state["cache_tokens"], ["runtime-token"] * 2)
+        self.assertNotIn("--cache-to", sum(self.builds(run), []))
+        self.assertTrue(run.state["exposed"], "the probes reached buildx")
+        self.assertNotIn("runtime-token", run.state["exposed"])
+        self.assertNotIn("runtime-token", run.stdout)
+
+    def test_a_callers_own_credentials_stand_with_the_cache_off(self) -> None:
+        # Their own cache through build_flags keeps working: the empty
+        # values action.yaml passes do not blank what they exported.
+        run = run_action(
+            self.sandbox,
+            env={"ACTIONS_RUNTIME_TOKEN": "callers", "BUILD_IMAGES_CACHE_TOKEN": ""},
+            images=images("base"), build_flags="--cache-from type=gha,scope=mine",
+        )  # fmt: skip
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(run.state["cache_tokens"], ["callers"])
+
+    def test_pull_request_target_never_gets_the_token(self) -> None:
+        # There a pull request's inputs meet a token that can write the
+        # base branch's cache, and buildx, holding it, can be made to
+        # read a runner file into a build: --secret src=/proc/self/cmdline
+        # holds its own arguments.
+        env = {"GITHUB_EVENT_NAME": "pull_request_target"}
+        refused = self.run_cached(env, cache_write="true")
+        self.assertEqual(refused.status, 1)
+        self.assertIn(
+            "::error::cache_write is refused on pull_request_target events",
+            refused.annotations[0],
+        )
+        self.assertEqual(refused.mutations, [])
+        entries = json.dumps(
+            [{"name": "base", "context": "base",
+              "build_flags": ["--secret=id=a,src=/proc/self/cmdline"]},
+             {"name": "child", "context": "child"}]
+        )  # fmt: skip
+        read = self.run_cached(
+            env, images=entries, build_flags="--secret id=b,src=/proc/self/cmdline"
+        )
+        self.assertEqual(read.status, 0, read.stdout)
+        self.assertEqual(self.cache_args(read), [[], []])
+        self.assertNotIn("cache_tokens", read.state)
+        self.assertTrue(read.state["exposed"], "the probes reached buildx")
+        self.assertFalse([e for e in read.state["exposed"] if "runtime-token" in e])
+        self.assertIn(
+            "::notice::cache: gha is not used on pull_request_target events",
+            read.annotations[0],
+        )
+        # Nor does the planner fetch it there.
+        plan = self.sandbox.invoke(
+            [sys.executable, "-I", str(ROOT / "entrypoint.py"), "plan"],
+            {"INPUT_CACHE": "gha", **env},
+        )
+        self.assertEqual(plan.outputs["cache"], "false", plan.stdout)
+        # GitHub confines these events' writes away from trusted builds.
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                run = self.run_cached({"GITHUB_EVENT_NAME": event}, cache_write="true")
+                self.assertIn("--cache-to", self.builds(run)[0])
+
+    def test_flags_cannot_write_past_cache_write(self) -> None:
+        # buildx holds the cache token with cache: gha, so a --cache-to
+        # in the flags would write whatever cache_write and the event
+        # guard say; an images entry can come from the checkout.
+        gha_to = "type=gha,scope=release:base"
+        for flag in (["--cache-to", gha_to], [f"--cache-to={gha_to}"]):
+            with self.subTest(form=flag[0]):
+                shared = self.run_cached(build_flags=" ".join(flag))
+                self.assertEqual(shared.status, 1)
+                self.assertEqual(
+                    shared.annotations,
+                    ["::error::build_flags cannot pass --cache-to with cache: gha; "
+                     "cache_write alone sets the cache export"],
+                )  # fmt: skip
+                entries = json.dumps(
+                    [{"name": "base", "context": "base"},
+                     {"name": "child", "context": "child", "build_flags": flag}]
+                )  # fmt: skip
+                per_image = self.run_cached(images=entries)
+                self.assertEqual(per_image.status, 1)
+                self.assertIn(
+                    "images entry 'child' build_flags cannot pass --cache-to",
+                    per_image.annotations[0],
+                )
+                self.assertEqual(
+                    (shared.mutations, per_image.mutations), ([], []),
+                    "refused before the first build",
+                )  # fmt: skip
+        # Without cache: gha the action supplies no token, and a caller's
+        # own cache flags pass through as before.
+        manual = run_action(
+            self.sandbox, images=images("base"),
+            build_flags="--cache-to type=registry,ref=r/c",
+        )  # fmt: skip
+        self.assertEqual(manual.status, 0, manual.stdout)
+
+    def test_rejected_cache_inputs(self) -> None:
+        cases = {
+            "cache must be one of none, gha; got 'registry'": {"cache": "registry"},
+            "cache_write needs cache: gha": {"cache": "none", "cache_write": "true"},
+            "cache_scope needs cache: gha": {"cache": "", "cache_scope": "x"},
+            "cache is not available with build_command, whose tooling runs its own "
+            "builds": {"build_command": "make", "images": "[]"},
+            "cache_scope 'a,b' may hold only letters, digits, '.', '_', '-' and '/'": {
+                "cache_scope": "a,b"},
+            "cache_write must be 'true' or 'false', got 'always'": {"cache_write": "always"},
+        }  # fmt: skip
+        for message, inputs in cases.items():
+            with self.subTest(inputs=inputs):
+                run = self.run_cached(**inputs)
+                self.assertEqual(
+                    (run.status, run.annotations), (1, [f"::error::{message}"])
+                )
+                self.assertEqual(run.mutations, [])
+
+    def test_plan_fetches_credentials_only_for_the_cache(self) -> None:
+        for inputs, expected in (({}, "false"), ({"cache": "gha"}, "true")):
+            with self.subTest(inputs=inputs):
+                run = self.sandbox.invoke(
+                    [sys.executable, "-I", str(ROOT / "entrypoint.py"), "plan"],
+                    {f"INPUT_{k.upper()}": v for k, v in inputs.items()},
+                )
+                self.assertEqual(run.outputs["cache"], expected, run.stdout)
+                self.assertEqual(run.calls, [], "planning runs no docker")
 
 
 class ValidationTest(SandboxTestCase):

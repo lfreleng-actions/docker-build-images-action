@@ -544,6 +544,153 @@ jobs:
           docker image inspect chain-child:verify > /dev/null
           echo "push_by_digest validated ✅"
 
+  ### The layer cache: write it cold, then build warm from it alone ###
+  cache:
+    name: "Layer cache (GitHub Actions cache)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read  # Lists this run's cache entries, proving the writes
+    timeout-minutes: 20
+    services:
+      registry:
+        # yamllint disable-line rule:line-length
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    env:
+      # A scope of this run's own, so the cold build always starts cold.
+      CACHE_SCOPE: "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+
+      # No extra endpoints: harden-runner allows the Actions cache
+      # service itself, which this job proves under block mode. See
+      # the README's Layer cache section.
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test-docker-monorepo"
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lfreleng-actions/test-docker-monorepo
+          ref: b3768edbbc1828d580c5eba8cc4b003ee8df149a  # v0.1.0
+          path: fixture
+          persist-credentials: false
+
+      # A multi-platform release build under QEMU, where the cache pays
+      # most; buildkit reaches the host's registry on the host network.
+      - name: "Set up QEMU"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
+      - name: "Set up buildx for the local registry"
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: "Cold build, writing the cache"
+        uses: $/
+        with:
+          mode: push
+          setup_buildx: 'false'
+          path_prefix: fixture
+          images: ${{ env.MONOREPO_IMAGES }}
+          repositories: localhost:5000/cold
+          tags: '1.0.0'
+          platforms: 'linux/amd64,linux/arm64'
+          cache: gha
+          cache_write: 'true'
+          cache_scope: ${{ env.CACHE_SCOPE }}
+
+      # Drop the builder's own cache, so the warm build can hit only
+      # what it reads back from the Actions cache. The cold builds'
+      # records are kept first, in case the prune takes them too.
+      - name: "Empty the builder's local cache"
+        shell: bash
+        run: |
+          # Empty the builder's local cache
+          set -euo pipefail
+          docker buildx history ls --format json > "${RUNNER_TEMP}/cold.json"
+          docker buildx prune --all --force
+
+      - name: "Warm build, reading the cache"
+        uses: $/
+        with:
+          mode: push
+          setup_buildx: 'false'
+          path_prefix: fixture
+          images: ${{ env.MONOREPO_IMAGES }}
+          repositories: localhost:5000/warm
+          tags: '1.0.0'
+          platforms: 'linux/amd64,linux/arm64'
+          cache: gha
+          cache_scope: ${{ env.CACHE_SCOPE }}
+
+      - name: "Validate the cache and measure it"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Validate the cache and measure it
+          set -euo pipefail
+          # One cache index per image, under this run's scope.
+          query="key=index-${CACHE_SCOPE}:"
+          keys=$(gh api "repos/${GITHUB_REPOSITORY}/actions/caches?${query}" \
+            --jq '[.actions_caches[].key] | sort | join(" ")')
+          echo "Cache indexes: ${keys}"
+          for image in base-alpine chain-child util-echo; do
+            grep -q "index-${CACHE_SCOPE}:${image}-" <<< "${keys}"
+          done
+          # The three builds of each run, by their build records.
+          docker buildx history ls --format json > "${RUNNER_TEMP}/all.json"
+          records=$(jq -s --slurpfile cold "${RUNNER_TEMP}/cold.json" '
+            ($cold | map(.ref)) as $refs
+            | {cold: $cold, warm: map(select(.ref | IN($refs[]) | not))}
+            ' "${RUNNER_TEMP}/all.json")
+          jq -e '(.cold | length) == 3 and (.warm | length) == 3 and
+            ([.cold[], .warm[]] | all(.status == "Completed"))' <<< "${records}"
+          summary=$(jq -r '
+            def ts: (sub("\\.[0-9]+"; "") | fromdate)
+              + ([capture("(?<f>\\.[0-9]+)Z$").f] | first // "0" | tonumber);
+            def secs: map((.completed_at | ts) - (.created_at | ts)) | add;
+            def sum($k): map(.[$k]) | add;
+            def row($label):
+              "| \($label) | \(secs * 10 | round / 10)s"
+              + " | \(sum("cached_steps"))/\(sum("total_steps")) |";
+            (.cold | row("Cold")), (.warm | row("Warm"))' <<< "${records}")
+          {
+            echo "## Layer cache: test-docker-monorepo, two platforms"
+            echo
+            echo "| Build | Build time | Cached steps |"
+            echo "| ----- | ---------- | ------------ |"
+            echo "${summary}"
+            echo
+            echo "Image store: $(docker info --format '{{json .DriverStatus}}')"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+          # base-alpine and chain-child hit the cache with the builder's
+          # own gone; util-echo has no RUN step, so nothing to hit.
+          jq -e '([.warm[] | select(.cached_steps > 0)] | length) >= 2 and
+            (.warm | map(.cached_steps) | add)
+            > (.cold | map(.cached_steps) | add)' <<< "${records}"
+          echo "Layer cache validated ✅"
+
   ### Failure modes ###
   failures:
     name: "Failure modes"

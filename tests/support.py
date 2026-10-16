@@ -79,7 +79,10 @@ class Run:
         found = []
         for call in self.calls:
             head = call[1] if call[:1] == ["image"] else call[0]
-            if head not in MUTATING or call[:2] == ["buildx", "imagetools"]:
+            if head not in MUTATING or call[:2] in (
+                ["buildx", "imagetools"],
+                ["buildx", "inspect"],
+            ):
                 continue
             normalised = []
             for arg in call:

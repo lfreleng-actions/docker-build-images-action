@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from scripts import gha
-from scripts.flags import image_flags, shared_flags
+from scripts.flags import exports_cache, image_flags, shared_flags
 from scripts.gha import ActionError
 from scripts.refs import (
     COMPONENT,
@@ -24,8 +24,20 @@ from scripts.refs import (
 )
 
 MODES = ("load", "push")
+CACHES = ("none", "gha")
+# Events that build a pull request's code with a cache token scoped to
+# the base branch, whose cache trusted builds read.
+UNTRUSTED_EVENTS = ("pull_request_target",)
 # Docker's grammar for a tag.
 _TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+# A cache scope prefix: safe inside buildx's CSV --cache-* values.
+_SCOPE = re.compile(r"[A-Za-z0-9._/-]+")
+
+
+def untrusted_event() -> str:
+    """This run's event when it is one of UNTRUSTED_EVENTS, else empty."""
+    event = gha.env("GITHUB_EVENT_NAME")
+    return event if event in UNTRUSTED_EVENTS else ""
 
 
 def valid_repository(prefix: str) -> bool:
@@ -139,6 +151,9 @@ class Settings:
     summary: bool = True
     setup_buildx: bool = True
     build_flags: tuple[str, ...] = ()
+    cache: str = "none"
+    cache_write: bool = False
+    cache_scope: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -172,6 +187,9 @@ class Settings:
             summary=gha.env_bool("INPUT_SUMMARY", "summary", True),
             setup_buildx=gha.env_bool("INPUT_SETUP_BUILDX", "setup_buildx", True),
             build_flags=tuple(shared_flags(env("INPUT_BUILD_FLAGS"))),
+            cache=env("INPUT_CACHE").strip() or "none",
+            cache_write=gha.env_bool("INPUT_CACHE_WRITE", "cache_write", False),
+            cache_scope=env("INPUT_CACHE_SCOPE").strip(),
         )
         settings.check()
         return settings
@@ -220,7 +238,56 @@ class Settings:
                     f"repositories entry '{repository}' is not a valid repository prefix "
                     "(such as ghcr.io/org or docker.io/onap)"
                 )
+        self._check_cache()
         self._check_lengths()
+
+    def _check_cache(self) -> None:
+        if self.cache not in CACHES:
+            raise ActionError(
+                f"cache must be one of {', '.join(CACHES)}; got '{self.cache}'"
+            )
+        if self.cache == "none":
+            for name, value in (
+                ("cache_write", self.cache_write),
+                ("cache_scope", self.cache_scope),
+            ):
+                if value:
+                    raise ActionError(f"{name} needs cache: gha")
+            return
+        if self.build_command:
+            raise ActionError(
+                "cache is not available with build_command, whose tooling runs its "
+                "own builds"
+            )
+        if self.cache_scope and not _SCOPE.fullmatch(self.cache_scope):
+            raise ActionError(
+                f"cache_scope '{self.cache_scope}' may hold only letters, digits, "
+                "'.', '_', '-' and '/'"
+            )
+        # The lanes decide when to write, but one combination is never
+        # right. GitHub confines a pull_request run's cache writes to
+        # that pull request, while pull_request_target writes to the
+        # base branch's cache, which trusted builds then read.
+        event = untrusted_event()
+        if self.cache_write and event:
+            raise ActionError(
+                f"cache_write is refused on {event} events, which write to the base "
+                "branch's cache from a pull request's code. Write it from trusted "
+                "events, such as push"
+            )
+        # With cache: gha a --cache-to among the flags, perhaps from an
+        # images entry the checkout supplied, would contradict
+        # cache_write, which alone decides the cache export.
+        sources = [("build_flags", self.build_flags)] + [
+            (f"images entry '{image['name']}' build_flags", image_flags(image))
+            for image in self.images
+        ]
+        for origin, flags in sources:
+            if exports_cache(flags):
+                raise ActionError(
+                    f"{origin} cannot pass --cache-to with cache: gha; cache_write "
+                    "alone sets the cache export"
+                )
 
     def _check_lengths(self) -> None:
         # Before anything builds: in push mode an overlong later image

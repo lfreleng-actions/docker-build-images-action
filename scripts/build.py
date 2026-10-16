@@ -20,11 +20,11 @@ import re
 import sys
 import traceback
 
-from scripts import gha, hatch, native, push
+from scripts import cache, gha, hatch, native, push
 from scripts.gha import ActionError
 from scripts.outcome import Outcome, compact
 from scripts.refs import PATH, declared_images
-from scripts.settings import Settings
+from scripts.settings import Settings, untrusted_event
 
 # The verify and merge lanes' check on the namespace in load mode, where
 # it prefixes every tag, kept so their message stays identical. It
@@ -56,13 +56,16 @@ def _multi(settings: Settings) -> bool:
 
 
 def plan(settings: Settings) -> dict[str, str]:
-    """The buildx driver, whether to set it up, and whether QEMU is needed."""
+    """The buildx driver, whether to set it up, whether QEMU is needed,
+    and whether to fetch the Actions cache credentials."""
     multi = _multi(settings)
     container = (multi or settings.push_by_digest) and bool(settings.repositories)
     return {
         "driver": "docker-container" if container else "docker",
         "qemu": str(multi).lower(),
         "setup_buildx": str(settings.setup_buildx).lower(),
+        # Never fetched where build_all would withhold them anyway.
+        "cache": str(settings.cache == "gha" and not untrusted_event()).lower(),
     }
 
 
@@ -101,16 +104,17 @@ def preflight(settings: Settings) -> str:
     return cwd
 
 
-def build(settings: Settings, outcome: Outcome) -> None:
+def build(settings: Settings, outcome: Outcome, credentials: cache.Credentials) -> None:
     """Build every image as the mode directs."""
     cwd = preflight(settings)
-    if settings.mode == "push":
-        push.build_all(settings, cwd, outcome)
-        return
     if settings.build_command:
         hatch.run(settings.build_command, settings.build_command_images, cwd, outcome)
+        return
+    access = cache.access(settings, cwd, credentials)
+    if settings.mode == "push":
+        push.build_all(settings, cwd, outcome, access)
     else:
-        native.build_all(settings, cwd, outcome)
+        native.build_all(settings, cwd, outcome, access)
 
 
 def _bullets(items: list[str], empty: str) -> list[str]:
@@ -212,6 +216,8 @@ def _pin_builder() -> None:
 
 def main() -> int:
     """Run the action; returns the process exit status."""
+    # First, so no docker call, build or build_command inherits them.
+    credentials = cache.take_credentials()
     try:
         settings = Settings.from_env()
         if sys.argv[1:] == ["plan"]:
@@ -220,7 +226,7 @@ def main() -> int:
             return 0
         _pin_builder()
         outcome = Outcome()
-        build(settings, outcome)
+        build(settings, outcome, credentials)
         publish(settings, outcome)
         return gate(settings, outcome)
     except ActionError as err:

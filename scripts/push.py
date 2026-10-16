@@ -42,7 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from scripts import docker, gha
+from scripts import cache, docker, gha
 from scripts.gha import ActionError
 from scripts.native import build_args, dockerfile_of
 from scripts.outcome import Outcome
@@ -108,7 +108,9 @@ def _build(cmd: list[str], cwd: str, group: str, local_tag: str) -> None:
         raise ActionError(f"Build failed for {local_tag} (exit {status})")
 
 
-def build_all(settings: Settings, cwd: str, outcome: Outcome) -> None:
+def build_all(
+    settings: Settings, cwd: str, outcome: Outcome, cache_access: str = ""
+) -> None:
     """Build and push every entry, recording each pushed digest.
 
     Stops at the first failure: the failed image records as failed and
@@ -117,7 +119,8 @@ def build_all(settings: Settings, cwd: str, outcome: Outcome) -> None:
     push completed, recorded as soon as its digest is known, so a later
     failure in the same image (a pull-back, a tag) still reports it; one
     that failed part-way can leave some of its tags behind, which the
-    failed entry flags.
+    failed entry flags. ``cache_access`` is scripts/cache.py's access();
+    empty, no cache.
     """
     native = native_platform()
     platforms = settings.platforms or (native,)
@@ -127,6 +130,7 @@ def build_all(settings: Settings, cwd: str, outcome: Outcome) -> None:
         scan=_scan_platform(platforms, native),
         alias=_alias_namespace(settings.image_namespace, settings.local_tag),
         metadata=os.path.join(tempfile.mkdtemp(), "build-meta.json"),
+        cache=cache_access,
     )
     for position, image in enumerate(settings.images):
         local_tag = f"{image['name']}:{settings.local_tag}"
@@ -149,6 +153,9 @@ class _Plan:
     scan: str
     alias: bool
     metadata: str
+    # The cache flags' credential attributes; empty, no cache
+    # (scripts/cache.py).
+    cache: str = ""
     # Named build contexts for images already pushed from the
     # docker-container builder, which cannot see the daemon's tags, so a
     # later FROM <name>:verify would otherwise pull from Docker Hub;
@@ -161,7 +168,10 @@ def _build_one(
     outcome: Outcome,
 ) -> None:  # fmt: skip
     name = image["name"]
-    common = ["-f", dockerfile_of(image), *build_args(image, settings.build_flags)]
+    common = [
+        "-f", dockerfile_of(image), *build_args(image, settings.build_flags),
+        *cache.flags(settings, name, plan.cache),
+    ]  # fmt: skip
     repos = [f"{prefix}/{name}" for prefix in settings.repositories]
     refs = [f"{repo}:{tag}" for repo in repos for tag in settings.tags]
     tag_args = [arg for ref in refs for arg in ("-t", ref)]

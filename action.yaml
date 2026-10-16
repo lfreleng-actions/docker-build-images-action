@@ -134,7 +134,7 @@ inputs:
     required: false
     default: ""
 
-  # --- Builder and reporting ----------------------------------------
+  # --- Builder -------------------------------------------------------
   setup_buildx:
     description: >
       Set up buildx with the driver the build needs: 'docker', whose
@@ -143,6 +143,36 @@ inputs:
       builder already set up.
     required: false
     default: "true"
+
+  # --- Layer cache ----------------------------------------------------
+  cache:
+    description: >
+      'none' builds every layer afresh. 'gha' reads the BuildKit layer
+      cache from the GitHub Actions cache, one scope per image, on a
+      builder that can use it: docker-container, or the docker driver
+      on Docker's containerd image store. Any other builder, and any
+      pull_request_target run, builds without it, with a notice; see
+      the README.
+    required: false
+    default: "none"
+  cache_write:
+    description: >
+      cache: gha. Write the cache as well as reading it. Set it on
+      trusted events only, such as push, so that pull request builds
+      only read. pull_request_target runs refuse it, and build
+      without the cache.
+    required: false
+    default: "false"
+  cache_scope:
+    description: >
+      cache: gha. Prefix for each image's cache scope, which is
+      otherwise the image name, so that lanes building different
+      platforms keep separate caches. Letters, digits, '.', '_', '-'
+      and '/'.
+    required: false
+    default: ""
+
+  # --- Reporting -------------------------------------------------------
   summary:
     description: "Write a build report to the step summary"
     required: false
@@ -208,6 +238,9 @@ runs:
         INPUT_BUILD_COMMAND_IMAGES: ${{ inputs.build_command_images }}
         INPUT_SUMMARY: ${{ inputs.summary }}
         INPUT_SETUP_BUILDX: ${{ inputs.setup_buildx }}
+        INPUT_CACHE: ${{ inputs.cache }}
+        INPUT_CACHE_WRITE: ${{ inputs.cache_write }}
+        INPUT_CACHE_SCOPE: ${{ inputs.cache_scope }}
       run: |
         # Plan the builder
         # Standard library only, so no setup-python step: GitHub-hosted
@@ -235,6 +268,33 @@ runs:
       with:
         driver: ${{ steps.plan.outputs.driver }}
 
+    # The Actions cache service's token and URLs reach JavaScript
+    # actions only, never a run step, and buildx needs them in its own
+    # environment. Passed on as this step's outputs, they reach the
+    # build step alone, where exporting them to GITHUB_ENV would hand
+    # every ACTIONS_* variable (an OIDC request token among them) to
+    # every later step of the caller's job.
+    - name: "Read the Actions cache credentials"
+      id: runtime
+      if: steps.plan.outputs.cache == 'true'
+      # yamllint disable-line rule:line-length
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+      with:
+        script: |
+          const names = {
+            token: 'ACTIONS_RUNTIME_TOKEN',
+            results_url: 'ACTIONS_RESULTS_URL',
+            cache_url: 'ACTIONS_CACHE_URL',
+            cache_service_v2: 'ACTIONS_CACHE_SERVICE_V2',
+          };
+          for (const [output, name] of Object.entries(names)) {
+            const value = process.env[name] || '';
+            if (output === 'token' && value) {
+              core.setSecret(value);
+            }
+            core.setOutput(output, value);
+          }
+
     - name: "Build images"
       id: build
       shell: bash
@@ -255,10 +315,21 @@ runs:
         INPUT_BUILD_COMMAND_IMAGES: ${{ inputs.build_command_images }}
         INPUT_SUMMARY: ${{ inputs.summary }}
         INPUT_SETUP_BUILDX: ${{ inputs.setup_buildx }}
+        INPUT_CACHE: ${{ inputs.cache }}
+        INPUT_CACHE_WRITE: ${{ inputs.cache_write }}
+        INPUT_CACHE_SCOPE: ${{ inputs.cache_scope }}
         # The builder set up above, empty when setup was skipped. With
         # the docker driver setup-buildx selects nothing, so without
         # this a builder the job selected earlier would be used.
         BUILD_IMAGES_BUILDER: ${{ steps.buildx.outputs.name }}
+        # Empty unless cache: gha. The entry point removes them from its
+        # environment before any docker call, and passes them to buildx
+        # in the cache flags alone, so no build can read them.
+        BUILD_IMAGES_CACHE_TOKEN: ${{ steps.runtime.outputs.token }}
+        BUILD_IMAGES_CACHE_RESULTS_URL: ${{ steps.runtime.outputs.results_url }}
+        BUILD_IMAGES_CACHE_URL: ${{ steps.runtime.outputs.cache_url }}
+        # yamllint disable-line rule:line-length
+        BUILD_IMAGES_CACHE_SERVICE_V2: ${{ steps.runtime.outputs.cache_service_v2 }}
       run: |
         # Build images
         python3 -I "${GITHUB_ACTION_PATH}/entrypoint.py"

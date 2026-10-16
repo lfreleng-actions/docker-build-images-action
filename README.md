@@ -135,28 +135,53 @@ the mode: the tags, `--load`, `--push`, `--output`, `--platform`,
 `--check` and `--help`, which can succeed without producing an image
 that would then read as built.
 
+### Cache layers between runs
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+- uses: lfreleng-actions/docker-build-images-action@<sha>  # vX.Y.Z
+  with:
+    mode: push
+    images: ${{ steps.images.outputs.images_json }}
+    repositories: ghcr.io/my-org
+    tags: '1.2.3'
+    platforms: 'linux/amd64,linux/arm64'
+    cache: gha
+    # Write from trusted events alone; pull request builds read.
+    cache_write: ${{ github.event_name == 'push' }}
+    cache_scope: release
+```
+
+<!-- markdownlint-enable MD046 -->
+
+See [Layer cache](#layer-cache) for the builders that can use it.
+
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                   | Required | Default   | Description                                                                                        |
-| ---------------------- | -------- | --------- | -------------------------------------------------------------------------------------------------- |
-| `images`               | False    | `''`      | Images in build order: docker-build-matrix-action's `images_json` or `matrix` output               |
-| `path_prefix`          | False    | `.`       | Project root; contexts and Dockerfiles are relative to it                                          |
-| `image_namespace`      | False    | `''`      | Namespace for local tags; see [Local tags](#local-tags)                                            |
-| `local_tag`            | False    | `verify`  | Tag for each image's local working copy                                                            |
-| `build_flags`          | False    | `''`      | Extra buildx arguments for every image, split as a shell splits them                               |
-| `mode`                 | False    | `load`    | `load` into the daemon, or `push` to registries                                                    |
-| `repositories`         | False    | `''`      | `mode: push`: repository prefixes; each image pushes as `<prefix>/<name>`. Empty is a dry run      |
-| `tags`                 | False    | `''`      | `mode: push`: tags to push; required with `repositories`, refused with `push_by_digest`            |
-| `push_by_digest`       | False    | `false`   | `mode: push`: push untagged, by digest; see [Pushing by digest](#pushing-by-digest)                |
-| `platforms`            | False    | `''`      | `mode: push`: comma-separated platforms; empty is the runner's                                     |
-| `build_permit_fail`    | False    | `false`   | `mode: load`: report failed builds and pass the step                                               |
-| `skip_dependents`      | False    | `false`   | `mode: load`: skip an image whose same-repository base did not build                               |
-| `build_command`        | False    | `''`      | `mode: load`: the project's own image build command                                                |
-| `build_command_images` | False    | `''`      | References `build_command` produces; skips inference                                               |
-| `setup_buildx`         | False    | `true`    | Set up buildx with the driver the build needs                                                      |
-| `summary`              | False    | `true`    | Write a build report to the step summary                                                           |
+| Name                   | Required | Default  | Description                                                                                   |
+| ---------------------- | -------- | -------- | --------------------------------------------------------------------------------------------- |
+| `images`               | False    | `''`     | Images in build order: docker-build-matrix-action's `images_json` or `matrix` output          |
+| `path_prefix`          | False    | `.`      | Project root; contexts and Dockerfiles are relative to it                                     |
+| `image_namespace`      | False    | `''`     | Namespace for local tags; see [Local tags](#local-tags)                                       |
+| `local_tag`            | False    | `verify` | Tag for each image's local working copy                                                       |
+| `build_flags`          | False    | `''`     | Extra buildx arguments for every image, split as a shell splits them                          |
+| `mode`                 | False    | `load`   | `load` into the daemon, or `push` to registries                                               |
+| `repositories`         | False    | `''`     | `mode: push`: repository prefixes; each image pushes as `<prefix>/<name>`. Empty is a dry run |
+| `tags`                 | False    | `''`     | `mode: push`: tags to push; required with `repositories`, refused with `push_by_digest`       |
+| `push_by_digest`       | False    | `false`  | `mode: push`: push untagged, by digest; see [Pushing by digest](#pushing-by-digest)           |
+| `platforms`            | False    | `''`     | `mode: push`: comma-separated platforms; empty is the runner's                                |
+| `build_permit_fail`    | False    | `false`  | `mode: load`: report failed builds and pass the step                                          |
+| `skip_dependents`      | False    | `false`  | `mode: load`: skip an image whose same-repository base did not build                          |
+| `build_command`        | False    | `''`     | `mode: load`: the project's own image build command                                           |
+| `build_command_images` | False    | `''`     | References `build_command` produces; skips inference                                          |
+| `setup_buildx`         | False    | `true`   | Set up buildx with the driver the build needs                                                 |
+| `cache`                | False    | `none`   | `gha` reads the BuildKit layer cache from the Actions cache; see [Layer cache](#layer-cache)  |
+| `cache_write`          | False    | `false`  | `cache: gha`: write the cache too; for trusted events, refused on `pull_request_target`       |
+| `cache_scope`          | False    | `''`     | `cache: gha`: prefix for each image's cache scope, otherwise the image name                   |
+| `summary`              | False    | `true`   | Write a build report to the step summary                                                      |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -314,6 +339,95 @@ selected earlier would otherwise take the builds. Set
 `setup_buildx: false` to use a builder the job has already set up; the
 action then leaves the builder choice to the job.
 
+### Layer cache
+
+By default every build starts from nothing, rebuilding base-image
+chains and slow dependency installs on each run; under QEMU that
+dominates a release build. `cache: gha` keeps BuildKit's layer cache
+in the GitHub Actions cache. Each image reads its own scope, the image
+name, so images never evict one another's cache; `cache_scope`
+prefixes it, as `release:base`, so lanes that build different
+platforms keep separate caches too. `mode=max` keeps intermediate
+stages, where dependency installs tend to sit. A cache service
+failure never fails a build: a missing cache reads as a cold one, and
+BuildKit carries on past a failed write.
+
+**Builders.** The action checks the builder before the first build.
+Where the builder cannot use the cache, the images build as they
+would without it, and a notice says why.
+
+<!-- markdownlint-disable MD013 -->
+
+| Build path                                                         | Builder                                 | Cache                                                               |
+| ------------------------------------------------------------------ | --------------------------------------- | ------------------------------------------------------------------- |
+| `mode: push` with repositories, multi-platform or `push_by_digest` | `docker-container`                      | Yes                                                                 |
+| `mode: load`, and a single-platform tagged push                    | `docker` driver, classic image store    | No: that driver cannot export one                                   |
+| `mode: load`, and a single-platform tagged push                    | `docker` driver, containerd image store | Yes                                                                 |
+| `setup_buildx: false`                                              | The caller's                            | Yes on `docker-container`, `remote` and `kubernetes`; else as above |
+| `build_command`                                                    | The project's tooling                   | Refused: that tooling runs its own builds                           |
+
+<!-- markdownlint-enable MD013 -->
+
+`mode: load` keeps the `docker` driver, since same-repository chains
+need it (see [Builder](#builder)), so whether a load build caches
+depends on the runner's image store.
+
+**Trust.** The cache feeds every later build, so a poisoned layer
+would ship in a release. `cache: gha` on its own reads; `cache_write`
+adds the write, and a lane should set it on trusted events alone,
+such as a push to a protected branch. With `cache: gha`, `cache_write`
+alone decides the write: the action refuses `--cache-to` in
+`build_flags` and in every images entry's `build_flags`, which can
+come from the checkout. GitHub confines a `pull_request` run's cache
+to that pull request, so its token can write nowhere a trusted build
+reads. A `pull_request_target` run instead builds a pull request's
+inputs with a token that can write the base branch's cache, and those
+inputs can steer buildx, which holds the token, into reading a runner
+file such as `/proc/self/cmdline` into a build. So on
+`pull_request_target` the action refuses `cache_write`, never fetches
+the token, and builds without the cache, with a notice.
+
+**Credentials.** BuildKit reaches the cache with the job's Actions
+runtime token, which GitHub hands to JavaScript actions alone, and
+which can write the cache. The action reads it with
+`actions/github-script` and passes it to its own build step, rather
+than exporting it, and every other `ACTIONS_*` variable, to the rest
+of the job through `GITHUB_ENV`. The build step then takes it out of
+its environment before any docker call and hands it to buildx in the
+`--cache-from` and `--cache-to` values alone. So no build reads it
+from its environment, neither a `RUN` instruction nor a bare
+`--build-arg NAME` or `--secret env=NAME`, which buildx fills from
+there.
+
+**Egress.** A job running harden-runner in block mode needs no extra
+endpoints. Its agent allows the Actions cache service itself:
+`*.actions.githubusercontent.com`, which covers the cache API, and
+the `productionresultssa*.blob.core.windows.net` storage accounts
+that hold its blobs, and its pre-step adds the run's own cache host.
+This repository's `cache` test job runs under block mode with the
+shared allow-list alone. Do not add `*.blob.core.windows.net` to an
+allow-list: it admits any Azure storage account, including one
+anyone can create, so it opens an exfiltration path.
+
+**Measured.** The `cache` test job builds test-docker-monorepo's three
+images for `linux/amd64` and `linux/arm64` twice: cold, writing the
+cache, then warm, after emptying the builder's own cache, so every
+hit comes from the Actions cache. Each run reports the build times and
+cached steps in its step summary. One run on a GitHub-hosted
+`ubuntu-24.04` runner measured:
+
+| Build                      | BuildKit build time | Cached steps |
+| -------------------------- | ------------------- | ------------ |
+| Cold, writing the cache    | 7.9s                | 0 of 31      |
+| Warm, from the cache alone | 2.6s                | 4 of 28      |
+
+The fixture's images are small, with one `RUN` step each in
+`base-alpine` and `chain-child`, and none in `util-echo`; the four
+warm hits are those two steps on both platforms, the arm64 pair
+emulated. The saving grows with the work a cached layer holds, so a
+project with real dependency installs under QEMU gains far more than
+these seconds.
+
 ## Compatibility
 
 `tests/legacy/` holds the three lanes' build step bodies, extracted
@@ -367,7 +481,8 @@ one for one. The release lane's `GHCR_PUBLISH`, `DOCKERHUB` and
 ## Notes
 
 - Needs `python3` 3.10 or later on the runner, as GitHub-hosted runners
-  provide. The action installs nothing beyond buildx and QEMU.
+  provide. The action installs nothing beyond buildx and QEMU, and
+  runs `actions/github-script` for `cache: gha` alone.
 - Building runs repository-controlled code: every `Dockerfile`'s `RUN`
   instructions execute in BuildKit, and `build_command` runs on the
   runner itself. Treat an untrusted checkout's builds as untrusted
