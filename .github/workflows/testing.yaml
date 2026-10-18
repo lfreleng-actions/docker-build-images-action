@@ -43,7 +43,7 @@ jobs:
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -81,7 +81,7 @@ jobs:
       # bases from Docker Hub, which the allow-list carries.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -162,7 +162,7 @@ jobs:
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -239,7 +239,7 @@ jobs:
       # from Docker Hub.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -397,7 +397,7 @@ jobs:
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -572,7 +572,7 @@ jobs:
       # the README's Layer cache section.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -706,7 +706,7 @@ jobs:
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
         with:
           egress-policy: 'block'
           allowed-endpoints: >
