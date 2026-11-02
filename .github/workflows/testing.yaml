@@ -37,13 +37,13 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -73,15 +73,15 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       # The builds pull the fixture's digest-pinned alpine and busybox
       # bases from Docker Hub, which the allow-list carries.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -156,13 +156,13 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -231,15 +231,15 @@ jobs:
           - 5000:5000
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       # Multi-platform builds also pull the buildkit and binfmt images
       # from Docker Hub.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -391,13 +391,13 @@ jobs:
           - 5001:5000
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -563,16 +563,16 @@ jobs:
       CACHE_SCOPE: "ci-${{ github.run_id }}-${{ github.run_attempt }}"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       # No extra endpoints: harden-runner allows the Actions cache
       # service itself, which this job proves under block mode. See
       # the README's Layer cache section.
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -700,13 +700,13 @@ jobs:
     timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
+      - uses: lfreleng-actions/harden-runner-block-action@2fed66c9c36c4687c31ca349b925b81ec629673f  # v0.15.0
         with:
-          config: '@56d70f0eae78f334a598d1ffe071d4b821517b22'  # v0.17.1
+          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d'  # v0.19.0
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: 'block'
           allowed-endpoints: >
