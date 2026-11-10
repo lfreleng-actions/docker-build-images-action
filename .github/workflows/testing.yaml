@@ -198,22 +198,58 @@ jobs:
           build_command: 'make images TAG=ci2'
           build_command_images: 'base-alpine:ci2 chain-child:ci2 util-echo:ci2'
 
+      - name: "Save an image archive for docker load"
+        shell: bash
+        run: |
+          # Save an image archive for docker load
+          set -euo pipefail
+          docker tag base-alpine:ci loaded-base:ci
+          docker save -o fixture/loaded-base.tar loaded-base:ci
+          docker rmi loaded-base:ci
+
+      - name: "Infer the image docker load restores"
+        id: loaded
+        uses: $/
+        with:
+          path_prefix: fixture
+          build_command: 'docker load -i loaded-base.tar'
+
+      - name: "Pull and re-tag only [expected failure]"
+        id: pulled
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: fixture
+          # A pull by digest leaves no tag, so re-tag the digest itself.
+          # yamllint disable rule:line-length
+          build_command: >-
+            docker pull alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce &&
+            docker tag alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce pulled-only:ci
+          # yamllint enable rule:line-length
+
       - name: "Validate outputs"
         shell: bash
         env:
           INFERRED: ${{ steps.inferred.outputs.images }}
           DECLARED: ${{ steps.declared.outputs.images }}
+          LOADED: ${{ steps.loaded.outputs.images }}
+          PULLED: ${{ steps.pulled.outcome }}
         run: |
           # Validate outputs
           set -euo pipefail
-          # The daemon lists new tags sorted; pulled bases carry a
-          # registry digest on the runner's classic store and are
-          # skipped.
+          # The daemon lists new tags sorted; pulled bases emit no
+          # create or load event on either image store and are skipped.
           names='["base-alpine","chain-child","util-echo"]'
           jq -e --argjson got "${INFERRED}" \
             "(${names} | map(. + \":ci\")) == \$got" <<< null
           jq -e --argjson got "${DECLARED}" \
             "(${names} | map(. + \":ci2\")) == \$got" <<< null
+          [ "${LOADED}" = '["loaded-base:ci"]' ]
+          # The re-tag exists, so the step failed on attribution, not
+          # on the pull.
+          docker image inspect pulled-only:ci > /dev/null
+          [ "${PULLED}" = failure ] ||
+            { echo "::error::a pulled re-tag was attributed"; exit 1; }
           echo "build_command validated ✅"
 
   ### Push mode against a local registry ###

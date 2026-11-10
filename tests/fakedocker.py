@@ -21,6 +21,26 @@ substitute into ``FROM`` first.
 A push-by-digest ``--output`` stores a content-addressed manifest per
 name and no tag; ``buildx imagetools inspect --raw`` serves it back.
 
+The daemon's image events are recorded as a real daemon emits them:
+``create`` then ``tag`` for a build or ``commit``, ``load`` alone for
+``load``, ``pull`` for a pull and ``tag`` for a re-tag, each naming the
+image ID that ``image inspect --format '{{.Id}}'`` prints, and
+``volume create`` and ``volume rm`` record ``create`` and ``destroy``
+volume events. ``events`` streams them until stopped, honouring
+``--since`` and ``--filter``. As the daemon does, a client that
+connects late is replayed only the latest events: 256, or
+``events_history`` in the state. ``fail_events`` in the state makes
+``events`` fail as it starts (``start``), after its first line
+(``mid``) or as it starts after writing more to stderr than a pipe
+holds (``noisy``); ``events_delay`` holds the stream back that many
+seconds before it connects, as a slow client start does, and
+``fail_volume`` makes ``volume create`` fail. A Dockerfile line
+``# FAKE: reuse <ref>`` makes a build resolve to the image ``<ref>``
+already names, as a cache hit on an image already present does, so it
+emits a ``tag`` and no ``create``. ``image ls --all --no-trunc
+--format '{{.ID}}'`` lists every image ID. ``load -i <file>`` reads the tags to
+load from a JSON list in the file, standing in for an image archive.
+
 ``buildx inspect`` names the builder's driver (``driver`` in the
 state, docker by default), and ``info`` reports the store as the
 DriverStatus docker prints. A build with a gha cache records the
@@ -42,6 +62,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +81,18 @@ def _load() -> State:
 
 
 def _save(state: State) -> None:
-    Path(os.environ["FAKEDOCKER_STATE"]).write_text(json.dumps(state, indent=1))
+    # Replaced whole, never rewritten in place: a running ``events``
+    # reads the file while other invocations save it.
+    path = Path(os.environ["FAKEDOCKER_STATE"])
+    scratch = path.with_name(f"{path.name}.{os.getpid()}")
+    scratch.write_text(json.dumps(state, indent=1))
+    os.replace(scratch, path)
+
+
+def _event(state: State, action: str, actor: str, kind: str = "image") -> None:
+    state.setdefault("events", []).append(
+        {"time": time.time(), "type": kind, "action": action, "actor": actor}
+    )
 
 
 def _hash(*parts: str) -> str:
@@ -122,7 +154,21 @@ def _new_image(state: State, tags: list[str], digests: list[str], origin: str) -
         "digests": [familiar(digest) for digest in digests],
         "origin": origin,
     }
+    if origin == "pull":
+        _event(state, "pull", familiar(tags[0]))
+    elif origin == "load":
+        _event(state, "load", f"sha256:{image_id}")
+    else:
+        _event(state, "create", f"sha256:{image_id}")
+        for _ in tags:
+            _event(state, "tag", f"sha256:{image_id}")
     return image_id
+
+
+def _retag(state: State, image_id: str, ref: str) -> None:
+    _untag(state, ref)
+    state["images"][image_id]["tags"].append(familiar(ref))
+    _event(state, "tag", f"sha256:{image_id}")
 
 
 def _fail(message: str, code: int = 1) -> int:
@@ -236,6 +282,14 @@ def _buildx(state: State, args: list[str]) -> int:
                 return _fail(f"ERROR: pull access denied for {repository(ref)}")
         elif _find(state, ref) is None:
             return _fail(f"ERROR: pull access denied for {repository(ref)}")
+    reuse = re.search(r"^# FAKE: reuse (\S+)$", text, re.MULTILINE)
+    if reuse and not push and output.get("push-by-digest") != "true":
+        image_id = _find(state, reuse.group(1))
+        if image_id is None:
+            return _fail(f"fakedocker: nothing to reuse for {reuse.group(1)}", 2)
+        for tag in tags:
+            _retag(state, image_id, tag)
+        return 0
     if output.get("push-by-digest") == "true":
         return _push_by_digest(state, output, context, metadata)
     if push:
@@ -308,7 +362,9 @@ def _inspect(state: State, args: list[str]) -> int:
     if image_id is None:
         return _fail(f"Error: No such image: {args[0] if args else ''}")
     image = state["images"][image_id]
-    if fmt == "{{len .RepoDigests}}":
+    if fmt == "{{.Id}}":
+        print(f"sha256:{image_id}")
+    elif fmt == "{{len .RepoDigests}}":
         print(len(image["digests"]))
     elif fmt == "{{range .RepoDigests}}{{println .}}{{end}}":
         sys.stdout.write("".join(f"{d}\n" for d in image["digests"]))
@@ -333,6 +389,10 @@ def _inspect(state: State, args: list[str]) -> int:
 def _image_ls(state: State, args: list[str]) -> int:
     if state.get("fail_ls"):
         return _fail("Cannot connect to the Docker daemon")
+    if args == ["--all", "--no-trunc", "--format", "{{.ID}}"]:
+        for image_id in state["images"]:
+            print(f"sha256:{image_id}")
+        return 0
     if args != ["--format", "{{.Repository}}:{{.Tag}}"]:
         return _fail(f"fakedocker: unsupported image ls {args!r}", 2)
     for image in state["images"].values():
@@ -359,6 +419,116 @@ def _pull(state: State, args: list[str]) -> int:
     return 0
 
 
+def _load_archive(state: State, args: list[str]) -> int:
+    path = ""
+    it = iter(args)
+    for arg in it:
+        if arg in ("-i", "--input"):
+            path = next(it)
+    if not path:
+        return _fail("fakedocker: load reads only from -i", 2)
+    try:
+        tags = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return _fail(f"Error: open {path}: no such file or directory")
+    digests = []
+    if state["store"] == "containerd":
+        digests = [f"{repository(t)}@sha256:{_hash('load', t)}" for t in tags]
+    _new_image(state, tags, digests, "load")
+    for tag in tags:
+        print(f"Loaded image: {familiar(tag)}")
+    return 0
+
+
+def _commit(state: State, args: list[str]) -> int:
+    if len(args) != 2:
+        return _fail(f"fakedocker: unsupported commit {args!r}", 2)
+    digests = []
+    if state["store"] == "containerd":
+        digests = [f"{repository(args[1])}@sha256:{_hash('commit', args[1])}"]
+    _new_image(state, [args[1]], digests, "commit")
+    return 0
+
+
+def _events(args: list[str]) -> int:
+    """Stream the recorded events until stopped.
+
+    Reads the state file afresh each pass and never saves it, so the
+    invocations it watches keep theirs.
+    """
+    since = 0.0
+    fmt = ""
+    filters: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg == "--since":
+            since = float(next(it))
+        elif arg == "--format":
+            fmt = next(it)
+        elif arg == "--filter":
+            filters.append(next(it))
+        else:
+            return _fail(f"fakedocker: unsupported events {args!r}", 2)
+    kinds = {f.removeprefix("type=") for f in filters}
+    if (
+        fmt != "{{.Type}} {{.Action}} {{.Actor.ID}}"
+        or any(not f.startswith("type=") for f in filters)
+        or not kinds <= {"image", "volume"}
+    ):
+        return _fail(f"fakedocker: unsupported events {args!r}", 2)
+    path = Path(os.environ["FAKEDOCKER_STATE"])
+    state = json.loads(path.read_text())
+    failure = state.get("fail_events")
+    if failure == "start":
+        return _fail(
+            "permission denied while trying to connect to the docker API at "
+            "unix:///var/run/docker.sock"
+        )
+    if failure == "noisy":
+        sys.stderr.write("warning: retrying the connection\n" * 8192)
+        return _fail("error during connect: connection reset by peer")
+    time.sleep(float(state.get("events_delay", 0)))
+
+    def recorded() -> list[dict[str, Any]]:
+        try:
+            return json.loads(path.read_text()).get("events", [])
+        except (OSError, ValueError):
+            return []
+
+    history = int(state.get("events_history", 256))
+    events = recorded()
+    seen = len(events)
+    pending = events[max(seen - history, 0) :]
+    while True:
+        for event in pending:
+            if event["time"] < since or (kinds and event["type"] not in kinds):
+                continue
+            print(f"{event['type']} {event['action']} {event['actor']}", flush=True)
+            if failure == "mid":
+                return _fail("error during connect: unexpected EOF")
+        time.sleep(0.02)
+        events = recorded()
+        pending, seen = events[seen:], len(events)
+
+
+def _volume(state: State, args: list[str]) -> int:
+    if args[:1] == ["create"] and len(args) == 2:
+        if state.get("fail_volume"):
+            return _fail("Error response from daemon: volume plugin not available")
+        state.setdefault("volumes", []).append(args[1])
+        _event(state, "create", args[1], "volume")
+        print(args[1])
+        return 0
+    if args[:1] == ["rm"] and len(args) == 2:
+        if args[1] not in state.get("volumes", []):
+            return _fail(f"Error response from daemon: get {args[1]}: no such volume")
+        state["volumes"].remove(args[1])
+        _event(state, "destroy", args[1], "volume")
+        print(args[1])
+        return 0
+    return _fail(f"fakedocker: unsupported volume {args!r}", 2)
+
+
 def _buildx_inspect(state: State) -> int:
     if state.get("fail_buildx_inspect"):
         return _fail("ERROR: no builder found")
@@ -381,6 +551,8 @@ def _info(state: State, args: list[str]) -> int:
 def main(argv: list[str]) -> int:
     with open(os.environ["FAKEDOCKER_LOG"], "a", encoding="utf-8") as log:
         log.write(json.dumps(argv) + "\n")
+    if argv[:1] == ["events"]:
+        return _events(argv[1:])
     state = _load()
     try:
         return _dispatch(state, argv)
@@ -416,9 +588,14 @@ def _dispatch(state: State, argv: list[str]) -> int:
         source = _find(state, argv[1])
         if source is None:
             return _fail(f"Error: No such image: {argv[1]}")
-        _untag(state, argv[2])
-        state["images"][source]["tags"].append(familiar(argv[2]))
+        _retag(state, source, argv[2])
         return 0
+    if argv[:1] == ["load"]:
+        return _load_archive(state, argv[1:])
+    if argv[:1] == ["volume"]:
+        return _volume(state, argv[1:])
+    if argv[:1] == ["commit"]:
+        return _commit(state, argv[1:])
     if argv[:1] == ["push"]:
         image_id = _find(state, argv[1])
         if image_id is None:

@@ -153,6 +153,372 @@ class BuilderTest(SandboxTestCase):
                 self.assertEqual(run.outputs["images"], '["onap/util:verify"]')
 
 
+PULLED_REASON = (
+    "Every new image here carries a registry digest, which means a pulled base on "
+    "one image store and proves nothing on another, so either the command built "
+    "these and they need naming with the build_command_images input, or it built "
+    "nothing at all"
+)
+EVENTLESS_REASON = (
+    "The command neither created nor loaded their images: it re-tagged them, or "
+    "rebuilt them to an image already present before it ran. Name any it built "
+    "with the build_command_images input"
+)
+FALLBACK = "; inferring the images from registry digests instead"
+EVENTS = ["events", "--since", mock.ANY, "--format", "{{.Type}} {{.Action}} {{.Actor.ID}}",
+          "--filter", "type=image", "--filter", "type=volume"]  # fmt: skip
+
+
+class InferenceTest(SandboxTestCase):
+    """build_command inference from the daemon's image events."""
+
+    store = "containerd"
+
+    def infer(self, command: str) -> Run:
+        self.sandbox.write({"out/Dockerfile": BASE})
+        return run_action(self.sandbox, images="[]", build_command=command)
+
+    def assert_built(self, run: Run, *tags: str) -> None:
+        self.assertEqual(run.status, 0, run.stdout)
+        self.assertEqual(json.loads(run.outputs["images"]), list(tags))
+
+    def assert_unattributed(self, run: Run, reason: str, *tags: str) -> None:
+        self.assertEqual(run.status, 1, run.stdout)
+        self.assertIn(
+            f"::error::build_command left {len(tags)} image(s) this run cannot "
+            f"attribute: {' '.join(tags)}. {reason}",
+            run.annotations,
+        )
+        self.assertEqual(run.outputs["images"], "[]")
+
+    def test_a_build_is_attributed(self) -> None:
+        run = self.infer("docker buildx build --load -t out:v out")
+        self.assert_built(run, "out:v")
+        self.assertIn(EVENTS, run.calls)
+
+    def test_a_commit_is_attributed(self) -> None:
+        self.assert_built(self.infer("docker commit c1 snapshot:v1"), "snapshot:v1")
+
+    def test_a_load_is_attributed(self) -> None:
+        # jib's dockerBuild and the Gradle plugins end with docker load.
+        self.sandbox.write({"image.tar": '["jib/app:v1"]'})
+        run = self.infer("docker load -i image.tar")
+        self.assert_built(run, "jib/app:v1")
+
+    def test_pulling_and_re_tagging_is_unattributable(self) -> None:
+        for store in ("classic", "containerd"):
+            with self.subTest(store=store):
+                self.tearDown()
+                self.store = store
+                self.setUp()
+                run = self.infer(
+                    "docker pull alpine:3 && docker tag alpine:3 pulled-only:ci"
+                )
+                self.assert_unattributed(
+                    run, PULLED_REASON, "alpine:3", "pulled-only:ci"
+                )
+
+    def test_only_the_built_image_of_a_mixed_command_is_attributed(self) -> None:
+        run = self.infer(
+            "docker pull alpine:3 && docker buildx build --load -t out:v out"
+        )
+        self.assert_built(run, "out:v")
+        self.assertIn(
+            "::notice::Skipping alpine:3: build_command neither created nor loaded its "
+            "image",
+            run.annotations,
+        )
+
+    def test_a_second_tag_of_a_built_image_is_attributed(self) -> None:
+        run = self.infer(
+            "docker buildx build --load -t out:v out && docker tag out:v out:alias"
+        )
+        self.assert_built(run, "out:alias", "out:v")
+
+    def test_a_re_tag_of_an_earlier_build_is_unattributable(self) -> None:
+        # The digest rule took a digest-free re-tag on the classic store
+        # for a build; no image was created, so it is not one.
+        self.tearDown()
+        self.store = "classic"
+        self.setUp()
+        self.sandbox.seed(
+            images={"old": {"tags": ["prior:v1"], "digests": [], "origin": "build"}}
+        )
+        run = self.infer("docker tag prior:v1 copy:v1")
+        self.assert_unattributed(run, EVENTLESS_REASON, "copy:v1")
+
+    def cache_hit(self, digests: list[str]) -> Run:
+        # The residual limit: a build resolving to an image already
+        # present creates nothing, so the caller has to name the image.
+        self.sandbox.seed(
+            images={
+                "old": {"tags": ["prior:v1"], "digests": digests, "origin": "build"}
+            }
+        )
+        self.sandbox.write({"out/Dockerfile": f"{BASE}# FAKE: reuse prior:v1\n"})
+        return run_action(
+            self.sandbox, images="[]",
+            build_command="docker buildx build --load -t out:v out",
+        )  # fmt: skip
+
+    def test_a_cache_hit_on_an_existing_image_is_unattributable(self) -> None:
+        run = self.cache_hit(["prior@sha256:1"])
+        self.assert_unattributed(run, PULLED_REASON, "out:v")
+
+    def test_a_cache_hit_without_a_digest_is_unattributable(self) -> None:
+        self.tearDown()
+        self.store = "classic"
+        self.setUp()
+        run = self.cache_hit([])
+        self.assert_unattributed(run, EVENTLESS_REASON, "out:v")
+
+    def test_a_cache_hit_beside_a_fresh_build_is_unattributable(self) -> None:
+        # A fresh build must not let a cache hit in the same command pass
+        # unnamed: the outputs would silently leave that image out.
+        self.sandbox.seed(
+            images={
+                "old": {"tags": ["prior:v1"], "digests": ["prior@sha256:1"],
+                        "origin": "build"}
+            }
+        )  # fmt: skip
+        self.sandbox.write(
+            {
+                "hit/Dockerfile": f"{BASE}# FAKE: reuse prior:v1\n",
+                "out/Dockerfile": BASE,
+            }
+        )
+        run = run_action(
+            self.sandbox, images="[]",
+            build_command="docker buildx build --load -t out:v out && "
+            "docker buildx build --load -t hit:v hit",
+        )  # fmt: skip
+        self.assertEqual(run.status, 1, run.stdout)
+        self.assertIn(
+            "::error::build_command left 1 image(s) this run cannot attribute: "
+            f"hit:v. {EVENTLESS_REASON}",
+            run.annotations,
+        )
+        self.assertEqual(json.loads(run.outputs["images"]), ["out:v"])
+
+    def test_a_re_tag_beside_a_fresh_build_is_unattributable(self) -> None:
+        self.sandbox.seed(
+            images={"old": {"tags": ["prior:v1"], "digests": [], "origin": "build"}}
+        )
+        run = self.infer(
+            "docker buildx build --load -t out:v out && docker tag prior:v1 copy:v1"
+        )
+        self.assertEqual(run.status, 1, run.stdout)
+        self.assertIn(
+            "::error::build_command left 1 image(s) this run cannot attribute: "
+            f"copy:v1. {EVENTLESS_REASON}",
+            run.annotations,
+        )
+        self.assertEqual(json.loads(run.outputs["images"]), ["out:v"])
+
+    def test_a_pushed_image_beside_a_fresh_classic_build_is_unattributable(
+        self,
+    ) -> None:
+        # On the classic store a fresh build proves digests mark pulled
+        # bases, but an image pushed earlier carries one too: a cache hit
+        # or a re-tag naming it must not be skipped as a pulled base.
+        commands = {
+            "cache hit": "docker buildx build --load -t hit:v hit",
+            "re-tag": "docker tag prior:v1 hit:v",
+        }
+        for case, second in commands.items():
+            with self.subTest(case=case):
+                self.tearDown()
+                self.store = "classic"
+                self.setUp()
+                self.sandbox.seed(
+                    images={
+                        "old": {"tags": ["prior:v1"], "digests": ["prior@sha256:1"],
+                                "origin": "build"}
+                    }
+                )  # fmt: skip
+                self.sandbox.write(
+                    {
+                        "hit/Dockerfile": f"{BASE}# FAKE: reuse prior:v1\n",
+                        "out/Dockerfile": BASE,
+                    }
+                )
+                run = run_action(
+                    self.sandbox, images="[]",
+                    build_command="docker buildx build --load -t out:v out && "
+                    + second,
+                )  # fmt: skip
+                self.assertEqual(run.status, 1, run.stdout)
+                self.assertIn(
+                    "::error::build_command left 1 image(s) this run cannot "
+                    f"attribute: hit:v. {EVENTLESS_REASON}",
+                    run.annotations,
+                )
+                self.assertEqual(json.loads(run.outputs["images"]), ["out:v"])
+
+    def test_a_failing_command_still_reports_what_it_built(self) -> None:
+        run = self.infer("docker buildx build --load -t out:v out && exit 3")
+        self.assertEqual(run.status, 1, run.stdout)
+        self.assertEqual(
+            [a for a in run.annotations if a.startswith("::error::")],
+            ["::error::build_command exited 3"],
+        )
+        self.assertEqual(json.loads(run.outputs["images"]), ["out:v"])
+
+    def test_a_command_that_builds_nothing_says_so(self) -> None:
+        run = self.infer("true")
+        self.assertEqual(run.status, 1)
+        self.assertIn(
+            "::error::build_command completed but created no new images. Name them "
+            "with the build_command_images input if the command builds images this "
+            "workflow cannot observe",
+            run.annotations,
+        )
+
+    def test_declared_images_skip_the_events(self) -> None:
+        self.sandbox.write({"out/Dockerfile": BASE})
+        run = run_action(
+            self.sandbox, images="[]",
+            build_command="docker buildx build --load -t out:v out",
+            build_command_images="out:v",
+        )  # fmt: skip
+        self.assert_built(run, "out:v")
+        self.assertFalse([call for call in run.calls if call[:1] == ["events"]])
+
+    def test_events_that_cannot_start_fall_back_to_digests(self) -> None:
+        notice = (
+            "::notice::Lost the daemon's image events (docker events exited 1: "
+            "permission denied while trying to connect to the docker API at "
+            f"unix:///var/run/docker.sock){FALLBACK}"
+        )
+        for store in ("classic", "containerd"):
+            with self.subTest(store=store):
+                self.tearDown()
+                self.store = store
+                self.setUp()
+                self.sandbox.seed(fail_events="start")
+                run = self.infer("docker buildx build --load -t out:v out")
+                self.assertIn(notice, run.annotations)
+                if store == "classic":
+                    self.assert_built(run, "out:v")
+                else:
+                    self.assert_unattributed(run, PULLED_REASON, "out:v")
+
+    def test_a_stream_lost_mid_command_falls_back_to_digests(self) -> None:
+        self.tearDown()
+        self.store = "classic"
+        self.setUp()
+        self.sandbox.seed(fail_events="mid")
+        run = self.infer(
+            "docker pull alpine:3 && docker buildx build --load -t out:v out"
+        )
+        self.assert_built(run, "out:v")
+        self.assertIn(
+            "::notice::Lost the daemon's image events (docker events exited 1: "
+            f"error during connect: unexpected EOF){FALLBACK}",
+            run.annotations,
+        )
+        self.assertIn(
+            "::notice::Skipping pulled image alpine:3 (registry digest, on a store "
+            "that gives local builds none)",
+            run.annotations,
+        )
+
+    def test_a_stream_that_connects_late_still_sees_the_build(self) -> None:
+        # The command waits for the stream, bracketed by marker volumes.
+        self.sandbox.seed(events_delay=2)
+        run = self.infer("docker buildx build --load -t out:v out")
+        self.assert_built(run, "out:v")
+        self.assertIn(EVENTS, run.calls)
+        marks = [c for c in run.calls if c[:2] == ["volume", "create"]]
+        self.assertEqual(len(marks), 2, run.calls)
+        self.assertEqual(run.state["volumes"], [])
+
+    def test_a_stream_that_connects_late_misses_no_early_build(self) -> None:
+        # A late client is replayed only the daemon's latest events (256
+        # on a real daemon, 4 here), so the first build's would be gone
+        # and the step would pass with that image missing.
+        self.sandbox.seed(events_delay=2, events_history=4)
+        dockerfiles = ("a/Dockerfile", "b/Dockerfile", "c/Dockerfile")
+        self.sandbox.write(dict.fromkeys(dockerfiles, BASE))
+        run = run_action(
+            self.sandbox, images="[]",
+            build_command=" && ".join(
+                f"docker buildx build --load -t {name}:v {name}" for name in "abc"
+            ),
+        )  # fmt: skip
+        self.assert_built(run, "a:v", "b:v", "c:v")
+
+    def test_a_marker_that_cannot_be_made_falls_back(self) -> None:
+        self.tearDown()
+        self.store = "classic"
+        self.setUp()
+        self.sandbox.seed(fail_volume=True)
+        run = self.infer("docker buildx build --load -t out:v out")
+        self.assert_built(run, "out:v")
+        self.assertIn(
+            "::notice::Lost the daemon's image events (docker volume create exited "
+            f"1: Error response from daemon: volume plugin not available){FALLBACK}",
+            run.annotations,
+        )
+        self.assertFalse([c for c in run.calls if c[:2] == ["volume", "rm"]])
+
+    def test_a_stream_lost_amid_its_own_errors_falls_back(self) -> None:
+        # More stderr than a pipe holds must not block the stream into
+        # passing for a quiet one.
+        self.tearDown()
+        self.store = "classic"
+        self.setUp()
+        self.sandbox.seed(fail_events="noisy")
+        run = self.infer("sleep 1 && docker buildx build --load -t out:v out")
+        self.assert_built(run, "out:v")
+        self.assertIn(
+            "::notice::Lost the daemon's image events (docker events exited 1: "
+            f"error during connect: connection reset by peer){FALLBACK}",
+            run.annotations,
+        )
+
+    def test_a_marker_that_never_arrives_falls_back(self) -> None:
+        import subprocess
+        import tempfile
+
+        from scripts import events
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        watch = events.Watch(proc, tempfile.TemporaryFile("w+"), ".")
+        out = io.StringIO()
+        made = subprocess.CompletedProcess(["docker"], 0, "", "")
+        with (
+            mock.patch.object(events.subprocess, "run", return_value=made),
+            mock.patch.object(events, "MARK_WAIT", 0.2),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertIsNone(watch.stop())
+        self.assertIsNotNone(proc.poll())
+        self.assertEqual(
+            out.getvalue(),
+            "::notice::Lost the daemon's image events (docker events did not "
+            f"show its marker within 0.2s){FALLBACK}\n",
+        )
+
+    def test_a_missing_docker_events_command_never_fails_the_step(self) -> None:
+        from scripts import events
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(events.subprocess, "Popen", side_effect=OSError("boom")),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertIsNone(events.Watch.start("."))
+        self.assertEqual(
+            out.getvalue(),
+            f"::notice::Could not watch the daemon's image events (boom){FALLBACK}\n",
+        )
+
+
 class SkipDependentsTest(SandboxTestCase):
     """skip_dependents skips images whose same-repository base failed."""
 

@@ -128,9 +128,10 @@ inputs:
   build_command_images:
     description: >
       Comma- or whitespace-separated name:tag references build_command
-      produces. Declaring them skips inference, which cannot tell local
-      builds from pulled bases on Docker's containerd image store, where
-      both carry registry digests.
+      produces. Declaring them skips inference, which attributes an
+      image only when the daemon reports creating or loading it during
+      the command, and so cannot claim one the command rebuilt to an
+      image ID already present.
     required: false
     default: ""
 

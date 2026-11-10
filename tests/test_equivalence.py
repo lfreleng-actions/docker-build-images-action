@@ -8,7 +8,7 @@ tests/legacy. Each scenario runs one of them and the action against the
 same scripted docker, and compares exit status, annotations, outputs,
 and every docker call that changes state, in order. Reads may differ.
 
-Four deliberate differences are accounted for, not hidden:
+Five deliberate differences are accounted for, not hidden:
 
 * the merge lane saves archives itself; the action leaves that to
   docker-save-images-action, as verify and release already do, so the
@@ -24,6 +24,11 @@ Four deliberate differences are accounted for, not hidden:
   RepoDigests in familiar form (onap/x, not docker.io/onap/x), so the
   release body's exact match fails every such release; that scenario
   is asserted on its own rather than compared
+* build_command inference reads the daemon's image events, so on the
+  containerd store it attributes the images a command built, where
+  the lanes' digest rule reports them all as unattributable; those
+  scenarios are asserted in test_action's InferenceTest, and every
+  classic-store scenario is still compared
 
 Outside these scenarios, inputs the lanes would fail on part-way are
 refused before anything builds (test_action's ValidationTest), and a
@@ -146,27 +151,6 @@ HATCH_SCENARIOS: dict[str, tuple[str, dict[str, str], str, str, dict[str, Any]]]
         {},
     ),
     "produces nothing (classic)": ("classic", {}, "true", "", {}),
-    "ordinary build (containerd)": (
-        "containerd",
-        {"out/Dockerfile": BASE},
-        "docker buildx build --load -t out:v out",
-        "",
-        {},
-    ),
-    "pulls a base and builds (containerd)": (
-        "containerd",
-        {"out/Dockerfile": BASE},
-        "docker pull alpine:3 && docker buildx build --load -t out:v out",
-        "",
-        {},
-    ),
-    "fails after leaving images (containerd)": (
-        "containerd",
-        {"out/Dockerfile": BASE},
-        "docker buildx build --load -t out:v out && exit 3",
-        "",
-        {},
-    ),
     "fails having built nothing": ("classic", {}, "exit 7", "", {}),
     "declared and built": (
         "containerd",
