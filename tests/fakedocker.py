@@ -30,9 +30,11 @@ volume events. ``events`` streams them until stopped, honouring
 ``--since`` and ``--filter``. As the daemon does, a client that
 connects late is replayed only the latest events: 256, or
 ``events_history`` in the state. ``fail_events`` in the state makes
-``events`` fail as it starts (``start``), after its first line
-(``mid``) or as it starts after writing more to stderr than a pipe
-holds (``noisy``); ``events_delay`` holds the stream back that many
+``events`` fail as it starts (``start``), after the first image event
+it prints, one the command caused and never a marker volume's
+(``mid``), or as it starts after writing more to stderr than a pipe
+holds (``noisy``); a failing ``events`` records how many image events
+it printed in the file ``lost_record`` names. ``events_delay`` holds the stream back that many
 seconds before it connects, as a slow client start does, and
 ``fail_volume`` makes ``volume create`` fail. A Dockerfile line
 ``# FAKE: reuse <ref>`` makes a build resolve to the image ``<ref>``
@@ -174,6 +176,20 @@ def _retag(state: State, image_id: str, ref: str) -> None:
 def _fail(message: str, code: int = 1) -> int:
     print(message, file=sys.stderr)
     return code
+
+
+def lost_record(state_file: Path) -> Path:
+    """Where a failing ``events`` records the image events it printed.
+
+    Kept beside the state, not in it: ``events`` never saves the state,
+    as the invocations it watches save theirs concurrently.
+    """
+    return state_file.with_name(f"{state_file.name}.events-lost")
+
+
+def _lose(state_file: Path, image_events: int, message: str) -> int:
+    lost_record(state_file).write_text(json.dumps({"image_events": image_events}))
+    return _fail(message)
 
 
 def _resolve_from(dockerfile: str, build_args: dict[str, str]) -> list[str]:
@@ -480,13 +496,15 @@ def _events(args: list[str]) -> int:
     state = json.loads(path.read_text())
     failure = state.get("fail_events")
     if failure == "start":
-        return _fail(
+        return _lose(
+            path,
+            0,
             "permission denied while trying to connect to the docker API at "
-            "unix:///var/run/docker.sock"
+            "unix:///var/run/docker.sock",
         )
     if failure == "noisy":
         sys.stderr.write("warning: retrying the connection\n" * 8192)
-        return _fail("error during connect: connection reset by peer")
+        return _lose(path, 0, "error during connect: connection reset by peer")
     time.sleep(float(state.get("events_delay", 0)))
 
     def recorded() -> list[dict[str, Any]]:
@@ -499,13 +517,18 @@ def _events(args: list[str]) -> int:
     events = recorded()
     seen = len(events)
     pending = events[max(seen - history, 0) :]
+    image_events = 0
     while True:
         for event in pending:
             if event["time"] < since or (kinds and event["type"] not in kinds):
                 continue
             print(f"{event['type']} {event['action']} {event['actor']}", flush=True)
-            if failure == "mid":
-                return _fail("error during connect: unexpected EOF")
+            if event["type"] == "image":
+                image_events += 1
+                if failure == "mid":
+                    return _lose(
+                        path, image_events, "error during connect: unexpected EOF"
+                    )
         time.sleep(0.02)
         events = recorded()
         pending, seen = events[seen:], len(events)

@@ -20,6 +20,7 @@ from unittest import mock
 
 from scripts.cache import Credentials
 from scripts.settings import IMAGES_ERROR
+from tests.fakedocker import lost_record
 from tests.support import ROOT, Run, SandboxTestCase, run_action
 
 BASE = "FROM alpine:3\n"
@@ -398,30 +399,45 @@ class InferenceTest(SandboxTestCase):
                 self.sandbox.seed(fail_events="start")
                 run = self.infer("docker buildx build --load -t out:v out")
                 self.assertIn(notice, run.annotations)
+                self.assertEqual(self.image_events_before_loss(), 0)
                 if store == "classic":
                     self.assert_built(run, "out:v")
                 else:
                     self.assert_unattributed(run, PULLED_REASON, "out:v")
 
+    def image_events_before_loss(self) -> int:
+        """How many image events the failed stream printed before it died."""
+        record = lost_record(self.sandbox.state_file).read_text()
+        return int(json.loads(record)["image_events"])
+
     def test_a_stream_lost_mid_command_falls_back_to_digests(self) -> None:
-        self.tearDown()
-        self.store = "classic"
-        self.setUp()
-        self.sandbox.seed(fail_events="mid")
-        run = self.infer(
-            "docker pull alpine:3 && docker buildx build --load -t out:v out"
-        )
-        self.assert_built(run, "out:v")
-        self.assertIn(
+        # The stream dies after the pull's image event, so the action
+        # has already read part of the command's events: it must drop
+        # them, not attribute from them.
+        notice = (
             "::notice::Lost the daemon's image events (docker events exited 1: "
-            f"error during connect: unexpected EOF){FALLBACK}",
-            run.annotations,
+            f"error during connect: unexpected EOF){FALLBACK}"
         )
-        self.assertIn(
-            "::notice::Skipping pulled image alpine:3 (registry digest, on a store "
-            "that gives local builds none)",
-            run.annotations,
-        )
+        for store in ("classic", "containerd"):
+            with self.subTest(store=store):
+                self.tearDown()
+                self.store = store
+                self.setUp()
+                self.sandbox.seed(fail_events="mid")
+                run = self.infer(
+                    "docker pull alpine:3 && docker buildx build --load -t out:v out"
+                )
+                self.assertIn(notice, run.annotations)
+                self.assertGreaterEqual(self.image_events_before_loss(), 1)
+                if store == "classic":
+                    self.assert_built(run, "out:v")
+                    self.assertIn(
+                        "::notice::Skipping pulled image alpine:3 (registry digest, "
+                        "on a store that gives local builds none)",
+                        run.annotations,
+                    )
+                else:
+                    self.assert_unattributed(run, PULLED_REASON, "alpine:3", "out:v")
 
     def test_a_stream_that_connects_late_still_sees_the_build(self) -> None:
         # The command waits for the stream, bracketed by marker volumes.
