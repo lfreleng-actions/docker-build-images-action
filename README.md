@@ -106,15 +106,32 @@ Makefile:
 ```
 
 `build_command_images` names the images the command produces. Leave
-it empty to have the action infer them from the image list around the
-command. On Docker's classic image store a local build carries no
-registry digest while a pulled base does, so an image that appeared
-without one came from this build. Creation times are never read, so a
-builder stamping a reproducible one, such as jib, infers like any
-other. On the containerd image store every image carries a digest; with
-no digest-free image to prove which is which, local builds and pulled
-bases look alike. The action then reports the images by name and asks
-for `build_command_images`, rather than guessing.
+it empty to have the action infer them from the daemon's image events
+while the command runs. A new tag counts as built when the ID of its
+image appears in a `create` or `load` event: `docker build`,
+`docker buildx build --load`, `docker commit` and `docker load` (how
+jib and the Gradle plugins hand over their images) emit those, while a
+pull or a `docker tag` of an existing image does not. This holds on
+both the classic and the containerd image store, and matching on the
+ID keeps a second tag of a built image attributed. Creation times are
+never read, so a builder stamping a reproducible one, such as jib,
+infers like any other. To mark where the command's events begin and
+end, the action creates and at once removes an empty volume named
+`docker-build-images-mark-<random>` before and after the command, so
+a command of any length loses none of its events.
+
+The action skips a pulled base the command leaves beside its builds:
+its image is new to the daemon, yet neither created nor loaded.
+
+One limit remains: a build that resolves to an image ID already
+present before the command ran, a pure cache hit, creates nothing and
+emits no event, so it looks like a re-tag. The action reports such an
+image by name and asks for `build_command_images`, rather than
+guessing, and fails the step even when the command built other
+images. If the action cannot
+watch the events, it says so in a notice and falls back to the
+registry digest, which tells local builds from pulled bases on the
+classic store alone.
 
 ### Extra buildx flags
 

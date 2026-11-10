@@ -82,6 +82,22 @@ def local_tags(cwd: str) -> list[str]:
     return sorted({line for line in out.split("\n") if line})
 
 
+def image_ids(cwd: str) -> set[str]:
+    """Every image ID in the local store, dangling ones included.
+
+    A failed listing is an error, as for local_tags: read as empty, an
+    image a command merely re-tagged would pass for a pulled base.
+    """
+    status, out = query(
+        ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"], cwd
+    )
+    if status != 0:
+        raise ActionError(
+            f"docker image ls failed (exit {status}); cannot list the image IDs"
+        )
+    return {line for line in out.split("\n") if line}
+
+
 def repo_digests(ref: str, cwd: str) -> list[str]:
     """``repo@sha256:...`` entries the store records for ``ref``."""
     proc = _capture(
@@ -119,6 +135,18 @@ def served_digest(ref: str, cwd: str) -> str:
             f"{(lines[-1:] or ['no error output'])[0]}"
         )
     return "sha256:" + hashlib.sha256(proc.stdout).hexdigest()
+
+
+def image_id(ref: str, cwd: str) -> str:
+    """The ID of the image ``ref`` names, as docker events report it.
+
+    A failed inspect is an error: an empty ID would match no event and
+    drop a built image from the results.
+    """
+    proc = _capture(["image", "inspect", "--format", "{{.Id}}", ref], cwd)
+    if proc.returncode != 0:
+        raise _inspect_failed(ref, proc)
+    return proc.stdout.strip()
 
 
 def digest_count(ref: str, cwd: str) -> str:
