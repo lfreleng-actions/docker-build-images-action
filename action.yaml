@@ -219,10 +219,23 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # The action's own interpreter, so neither the caller's PATH nor a
+    # .python-version in the caller's workspace chooses it.
+    # update-environment: false leaves the caller's PATH and Python
+    # variables as they were for its later steps.
+    - name: "Set up Python"
+      id: python
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      with:
+        python-version: "3.12"
+        update-environment: false
+
     - name: "Plan the builder"
       id: plan
       shell: bash
       env:
+        BUILD_IMAGES_PYTHON: ${{ steps.python.outputs.python-path }}
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_IMAGES: ${{ inputs.images }}
         INPUT_IMAGE_NAMESPACE: ${{ inputs.image_namespace }}
@@ -244,17 +257,10 @@ runs:
         INPUT_CACHE_SCOPE: ${{ inputs.cache_scope }}
       run: |
         # Plan the builder
-        # Standard library only, so no setup-python step: GitHub-hosted
-        # runners ship a suitable python3. -I (isolated mode) keeps the
-        # checked-out repository off sys.path; see entrypoint.py. Input
-        # validation runs here too, so a misconfiguration fails before
-        # any builder is set up.
-        if ! python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
-          > /dev/null 2>&1; then
-          echo "::error::python3 3.11 or later is required on the runner"
-          exit 1
-        fi
-        python3 -I "${GITHUB_ACTION_PATH}/entrypoint.py" plan
+        # -I (isolated mode) keeps the checked-out repository off
+        # sys.path; see entrypoint.py. Input validation runs here too,
+        # so a misconfiguration fails before any builder is set up.
+        "${BUILD_IMAGES_PYTHON}" -I "${GITHUB_ACTION_PATH}/entrypoint.py" plan
 
     - name: "Set up QEMU"
       if: steps.plan.outputs.qemu == 'true'
@@ -300,6 +306,9 @@ runs:
       id: build
       shell: bash
       env:
+        # Not PYTHON: build_command inherits this environment, and the
+        # caller's own PYTHON, such as a virtualenv, must reach it.
+        BUILD_IMAGES_PYTHON: ${{ steps.python.outputs.python-path }}
         INPUT_MODE: ${{ inputs.mode }}
         INPUT_IMAGES: ${{ inputs.images }}
         INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
@@ -333,4 +342,4 @@ runs:
         BUILD_IMAGES_CACHE_SERVICE_V2: ${{ steps.runtime.outputs.cache_service_v2 }}
       run: |
         # Build images
-        python3 -I "${GITHUB_ACTION_PATH}/entrypoint.py"
+        "${BUILD_IMAGES_PYTHON}" -I "${GITHUB_ACTION_PATH}/entrypoint.py"

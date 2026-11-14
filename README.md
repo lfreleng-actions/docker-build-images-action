@@ -497,12 +497,13 @@ one for one. The release lane's `GHCR_PUBLISH`, `DOCKERHUB` and
 
 ## Notes
 
-- Needs `python3` 3.11 or later on the runner, as current GitHub-hosted
-  images provide (`ubuntu-24.04` ships 3.12). On a runner whose
-  system `python3` is older, such as `ubuntu-22.04` with 3.10, the
-  action stops before building and reports that it needs 3.11. The
-  action installs nothing beyond buildx and QEMU, and runs
-  `actions/github-script` for `cache: gha` alone.
+- Runs on its own Python 3.12, set up by `actions/setup-python` with
+  `update-environment: false`: neither the caller's `PATH` nor a
+  `.python-version` in its workspace chooses the interpreter, and the
+  caller's later steps keep the Python they had. GitHub-hosted runners
+  carry 3.12 in their tool cache; a self-hosted runner without it
+  downloads it. Besides Python the action sets up buildx and QEMU, and
+  runs `actions/github-script` for `cache: gha` alone.
 - Building runs repository-controlled code: every `Dockerfile`'s `RUN`
   instructions execute in BuildKit, and `build_command` runs on the
   runner itself. Treat an untrusted checkout's builds as untrusted

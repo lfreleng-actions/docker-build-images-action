@@ -835,6 +835,26 @@ class PushTest(SandboxTestCase):
         self.assertEqual(plan, build)
         self.assertIn("INPUT_IMAGE_NAMESPACE", plan)
 
+    def test_steps_start_the_action_python_and_leave_the_callers(self) -> None:
+        steps = (ROOT / "action.yaml").read_text(encoding="utf-8").split("    - name:")
+        python = "${{ steps.python.outputs.python-path }}"
+        for step in steps:
+            name = step.split("\n", 1)[0].strip()
+            with self.subTest(step=name):
+                self.assertNotRegex(step, r"\n +PYTHON:")
+                if "entrypoint.py" in step:
+                    self.assertIn(f"BUILD_IMAGES_PYTHON: {python}", step)
+                    self.assertIn('"${BUILD_IMAGES_PYTHON}" -I ', step)
+
+    def test_build_command_keeps_the_callers_python(self) -> None:
+        caller = "/caller/venv/bin/python"
+        run_action(
+            self.sandbox, env={"PYTHON": caller, "BUILD_IMAGES_PYTHON": sys.executable},
+            images="[]", build_command='printf %s "${PYTHON}" > seen',
+        )  # fmt: skip
+        seen = (self.sandbox.workspace / "seen").read_text(encoding="utf-8")
+        self.assertEqual(seen, caller)
+
 
 BY_DIGEST = "push-by-digest=true,name-canonical=true,push=true"
 
