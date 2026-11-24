@@ -7,7 +7,7 @@
 
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable-next-line MD013 -->
-[![Linux Foundation](https://img.shields.io/badge/Linux-Foundation-blue)](https://linuxfoundation.org/) [![Source Code](https://img.shields.io/badge/GitHub-100000?logo=github&logoColor=white&color=blue)](https://github.com/lfreleng-actions/docker-build-images-action) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![pre-commit.ci status badge]][pre-commit.ci results page] [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lfreleng-actions/docker-build-images-action/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/docker-build-images-action)
+[![Linux Foundation](https://img.shields.io/badge/Linux-Foundation-blue)](https://linuxfoundation.org/) [![Source Code](https://img.shields.io/badge/GitHub-100000?logo=github&logoColor=white&color=blue)](https://github.com/lfreleng-actions/docker-build-images-action) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lfreleng-actions/docker-build-images-action/badge)](https://scorecard.dev/viewer/?uri=github.com/lfreleng-actions/docker-build-images-action)
 <!-- prettier-ignore-end -->
 
 Builds a list of container images in order, then either loads them
@@ -525,5 +525,3 @@ workflow adds real builds, a real registry, and multi-platform pushes.
 [docker-workflows]: https://github.com/lfreleng-actions/docker-workflows
 [docker-workflows#34]: https://github.com/lfreleng-actions/docker-workflows/issues/34
 [docker-workflows#117]: https://github.com/lfreleng-actions/docker-workflows/issues/117
-[pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/docker-build-images-action/main
-[pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/docker-build-images-action/main.svg
